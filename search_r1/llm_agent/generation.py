@@ -52,7 +52,7 @@ class LLMGenerationManager:
         )['input_ids']
 
     def _postprocess_responses(self, responses: torch.Tensor) -> torch.Tensor:
-        """Process responses to stop at search operation or answer operation."""
+        """Process responses to stop at search operation, recall operation, or answer operation."""
         responses_str = self.tokenizer.batch_decode(
             responses, 
             skip_special_tokens=True
@@ -60,6 +60,8 @@ class LLMGenerationManager:
 
         responses_str = [resp.split('</search>')[0] + '</search>'
                  if '</search>' in resp 
+                 else resp.split('</recall>')[0] + '</recall>'
+                 if '</recall>' in resp 
                  else resp.split('</answer>')[0] + '</answer>'
                  if '</answer>' in resp 
                  else resp
@@ -356,17 +358,24 @@ class LLMGenerationManager:
         NOTE: the function is the actual `step` function in the environment
         NOTE penalty_for_invalid is not included in observation shown to the LLM
         
+        Supports three action types:
+        - search: External API call, returns <information>...</information>
+        - recall: Internal memory retrieval, returns <memory>Retrieving internal knowledge...</memory>
+        - answer: Final answer, terminates the episode
+        
         Args:
-            envs: List of environment instances
             predictions: List of action predictions
             pad_token: Token to use for padding
+            active_mask: Mask indicating which samples are still active
+            do_search: Whether to actually call search API (for validation/testing)
             
         Returns:
-            List of observation strings
+            Tuple of (next_obs, dones, valid_action, is_search)
         """
         cur_actions, contents = self.postprocess_predictions(predictions)
         next_obs, dones, valid_action, is_search = [], [], [], []
         
+        # Batch process search queries (only for 'search' actions)
         search_queries = [content for action, content in zip(cur_actions, contents) if action == 'search']
         if do_search:
             search_results = self.batch_search(search_queries)
@@ -383,18 +392,29 @@ class LLMGenerationManager:
                 is_search.append(0)
             else:
                 if action == 'answer':
+                    # Final answer: terminate episode
                     next_obs.append('')
                     dones.append(1)
                     valid_action.append(1)
                     is_search.append(0)
                 elif action == 'search':
+                    # External search: call API and return <information>
                     next_obs.append(f'\n\n<information>{search_results.pop(0).strip()}</information>\n\n')
                     dones.append(0)
                     valid_action.append(1)
                     is_search.append(1)
+                elif action == 'recall':
+                    # Internal recall: return fixed trigger signal for parametric memory
+                    # The model will generate the actual memory content based on SFT training
+                    next_obs.append(f'\n\n<memory>Retrieving internal knowledge...</memory>\n\n')
+                    dones.append(0)
+                    valid_action.append(1)
+                    is_search.append(0)
                 else:
+                    # Invalid action: provide feedback
                     next_obs.append(f'\nMy previous action is invalid. \
-If I want to search, I should put the query between <search> and </search>. \
+If I want to search externally, I should put the query between <search> and </search>. \
+If I want to recall internal knowledge, I should put the query between <recall> and </recall>. \
 If I want to give the final answer, I should put the answer between <answer> and </answer>. Let me try again.\n')
                     dones.append(0)
                     valid_action.append(0)
@@ -407,19 +427,22 @@ If I want to give the final answer, I should put the answer between <answer> and
     def postprocess_predictions(self, predictions: List[Any]) -> Tuple[List[int], List[bool]]:
         """
         Process (text-based) predictions from llm into actions and validity flags.
+        Supports three action types: search, recall, and answer.
         
         Args:
             predictions: List of raw predictions
             
         Returns:
-            Tuple of (actions list, validity flags list)
+            Tuple of (actions list, contents list)
         """
         actions = []
         contents = []
                 
         for prediction in predictions:
             if isinstance(prediction, str): # for llm output
-                pattern = r'<(search|answer)>(.*?)</\1>'
+                # Priority: search > recall > answer (if multiple exist, take first match)
+                # This matches the "First-Internal-Then-External" bias
+                pattern = r'<(search|recall|answer)>(.*?)</\1>'
                 match = re.search(pattern, prediction, re.DOTALL)
                 if match:
                     content = match.group(2).strip()  # Return only the content inside the tags
