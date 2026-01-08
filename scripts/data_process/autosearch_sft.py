@@ -325,10 +325,15 @@ def process_sft_example(example, tokenizer, template_type='base', max_length=409
             assistant_start_char, offset_mapping
         )
     
+    # Return both tokenized data (for compatibility) and original text (for SFTDataset)
+    # SFTDataset expects 'question' (prompt) and 'answer' (response) columns
     return {
         'input_ids': input_ids.tolist(),
         'labels': labels.tolist(),
         'attention_mask': attention_mask.tolist(),
+        # Also save original text format for SFTDataset
+        'question': user_content,  # This will be used as prompt_key
+        'answer': assistant_content,  # This will be used as response_key
     }
 
 
