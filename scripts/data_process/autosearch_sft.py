@@ -32,9 +32,19 @@ import json
 import datasets
 from transformers import AutoTokenizer
 import numpy as np
-
-from verl.utils.hdfs_io import copy, makedirs
 import argparse
+
+# Optional import for HDFS support
+try:
+    from verl.utils.hdfs_io import copy, makedirs
+    HDFS_AVAILABLE = True
+except ImportError:
+    HDFS_AVAILABLE = False
+    # Define dummy functions if verl is not available
+    def copy(*args, **kwargs):
+        raise ImportError("verl module not available. Cannot copy to HDFS. Install verl or skip --hdfs_dir option.")
+    def makedirs(*args, **kwargs):
+        raise ImportError("verl module not available. Cannot create HDFS directories. Install verl or skip --hdfs_dir option.")
 
 
 def make_prefix(question, template_type='base'):
@@ -330,8 +340,9 @@ if __name__ == '__main__':
                         help='Output directory for parquet files')
     parser.add_argument('--output_file', type=str, default=None,
                         help='Output parquet file name (default: auto-detect from input filename)')
-    parser.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-3B',
-                        help='Tokenizer model name')
+    parser.add_argument('--model_name', type=str, 
+                        default='/home/hadoop-ai-search/dolphinfs_ssd_hadoop-ai-search/chongwenyue/model/Qwen2.5-3B-Instruct',
+                        help='Tokenizer model name or path')
     parser.add_argument('--template_type', type=str, default='base',
                         help='Prompt template type')
     parser.add_argument('--hdfs_dir', type=str, default=None,
@@ -419,7 +430,14 @@ if __name__ == '__main__':
     
     # Optional: Copy to HDFS
     if args.hdfs_dir is not None:
-        makedirs(args.hdfs_dir)
-        copy(src=args.output_dir, dst=args.hdfs_dir)
-        print(f"Copied to HDFS: {args.hdfs_dir}")
+        if not HDFS_AVAILABLE:
+            print(f"[Warning] verl module not available. Skipping HDFS copy.")
+            print(f"[Warning] To enable HDFS support, install verl module or skip --hdfs_dir option.")
+        else:
+            try:
+                makedirs(args.hdfs_dir)
+                copy(src=args.output_dir, dst=args.hdfs_dir)
+                print(f"Copied to HDFS: {args.hdfs_dir}")
+            except Exception as e:
+                print(f"[Error] Failed to copy to HDFS: {e}")
 
