@@ -464,8 +464,12 @@ class FSDPSFTTrainer(object):
                 tracking.log(data=metric, step=global_step)
             torch.distributed.barrier()
 
-            # save checkpoint
-            self.save_checkpoint(step=global_step)
+            # Note: Checkpoint saving moved to after all epochs complete
+
+        # Save final checkpoint after all epochs are complete
+        if rank == 0:
+            print(f'Saving final checkpoint at step {global_step} after {self.config.trainer.total_epochs} epochs')
+        self.save_checkpoint(step=global_step)
 
 
 from verl.trainer.fsdp_sft_trainer import FSDPSFTTrainer
