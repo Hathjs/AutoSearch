@@ -43,7 +43,16 @@ from torch.distributed.device_mesh import DeviceMesh
 
 import verl.utils.hdfs_io as hdfs_io
 from verl.utils.debug import log_gpu_memory_usage
-from peft import LoraConfig, TaskType, get_peft_model
+
+# Optional import for LoRA support
+try:
+    from peft import LoraConfig, TaskType, get_peft_model
+    PEFT_AVAILABLE = True
+except ImportError:
+    PEFT_AVAILABLE = False
+    LoraConfig = None
+    TaskType = None
+    get_peft_model = None
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_SFT_LOGGING_LEVEL', 'WARN'))
@@ -176,6 +185,11 @@ class FSDPSFTTrainer(object):
                                                                                attn_implementation='flash_attention_2',
                                                                                trust_remote_code=trust_remote_code)
             if self.config.model.get('lora_rank', 0) > 0:
+                if not PEFT_AVAILABLE:
+                    raise ImportError(
+                        "LoRA is enabled (lora_rank > 0) but peft module is not available. "
+                        "Please install peft: pip install peft"
+                    )
                 self.model.enable_input_require_grads()
                 # Convert config to regular Python types before creating PEFT model
                 lora_config = {
