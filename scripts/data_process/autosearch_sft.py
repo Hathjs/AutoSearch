@@ -328,6 +328,8 @@ if __name__ == '__main__':
                         help='Input JSONL file path')
     parser.add_argument('--output_dir', type=str, default='./data/autosearch_sft',
                         help='Output directory for parquet files')
+    parser.add_argument('--output_file', type=str, default=None,
+                        help='Output parquet file name (default: auto-detect from input filename)')
     parser.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-3B',
                         help='Tokenizer model name')
     parser.add_argument('--template_type', type=str, default='base',
@@ -392,9 +394,24 @@ if __name__ == '__main__':
     # Convert to HuggingFace dataset
     dataset = datasets.Dataset.from_list(processed_data)
     
+    # Determine output filename
+    if args.output_file:
+        output_filename = args.output_file
+    else:
+        # Auto-detect from input filename
+        input_basename = os.path.basename(args.input_file).lower()
+        if 'val' in input_basename or 'test' in input_basename:
+            output_filename = 'val.parquet'
+        elif 'train' in input_basename:
+            output_filename = 'train.parquet'
+        else:
+            # Default to train if cannot determine
+            output_filename = 'train.parquet'
+            print(f"[Warning] Cannot determine split type from input filename, defaulting to train.parquet")
+    
     # Save to parquet
     os.makedirs(args.output_dir, exist_ok=True)
-    output_file = os.path.join(args.output_dir, 'train.parquet')
+    output_file = os.path.join(args.output_dir, output_filename)
     print(f"Saving to {output_file}...")
     dataset.to_parquet(output_file)
     
