@@ -1,9 +1,9 @@
 # AutoSearch SFT Training Configuration
 data:
   train_batch_size: 64
-  micro_batch_size: 4  # gradient accumulation steps = train_batch_size / micro_batch_size
-  train_files: data/autosearch_sft_processed/train.parquet
-  val_files: data/autosearch_sft_processed/val.parquet
+  micro_batch_size: 32  # gradient accumulation steps = train_batch_size / micro_batch_size
+  train_files: /home/hadoop-ai-search/dolphinfs_ssd_hadoop-ai-search/chenqing30/cqproject/autosearch/data/autosearch_sft_processed/train.parquet
+  val_files:   /home/hadoop-ai-search/dolphinfs_ssd_hadoop-ai-search/chenqing30/cqproject/autosearch/data/autosearch_sft_processed/val.parquet
   prompt_key: question  # column name in parquet for prompt
   response_key: answer  # column name in parquet for response
   max_length: 4096

@@ -41,5 +41,5 @@ trainer:
   total_epochs: 1
   total_training_steps: null
   validate_before_training: False
-  logger: ['console', 'wandb']  # Change to ['console'] if wandb not available
+  logger: ['console']  # Change to ['console', 'wandb'] if wandb is configured
   seed: 42

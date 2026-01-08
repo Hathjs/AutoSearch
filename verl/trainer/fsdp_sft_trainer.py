@@ -58,6 +58,8 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_SFT_LOGGING_LEVEL', 'WARN'))
 
 
+
+
 def extract_step(path):
     match = re.search(r'global_step_(\d+)', path)
     if match:
@@ -131,6 +133,42 @@ class FSDPSFTTrainer(object):
                                       max_length=config.data.max_length,
                                       truncation=config.data.truncation)
 
+        # Define collate function with access to tokenizer
+        def collate_fn(batch):
+            """Custom collate function to pad sequences to the same length."""
+            # Find max length in batch
+            max_len = max(item['input_ids'].shape[0] for item in batch)
+            
+            # Get pad token id from tokenizer
+            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else (self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0)
+            
+            collated = {}
+            for key in ['input_ids', 'labels', 'attention_mask', 'position_ids', 'loss_mask']:
+                if key in batch[0]:
+                    # Pad sequences
+                    padded = []
+                    for item in batch:
+                        seq = item[key]
+                        if len(seq) < max_len:
+                            if key == 'labels':
+                                # Pad labels with -100 (ignore index)
+                                padding = torch.full((max_len - len(seq),), -100, dtype=seq.dtype)
+                            elif key == 'attention_mask' or key == 'loss_mask':
+                                # Pad masks with 0
+                                padding = torch.zeros(max_len - len(seq), dtype=seq.dtype)
+                            elif key == 'position_ids':
+                                # Pad position_ids with continuation
+                                last_pos = seq[-1].item() if len(seq) > 0 else 0
+                                padding = torch.arange(last_pos + 1, last_pos + 1 + max_len - len(seq), dtype=seq.dtype)
+                            else:  # input_ids
+                                # Pad input_ids with pad_token_id
+                                padding = torch.full((max_len - len(seq),), pad_token_id, dtype=seq.dtype)
+                            seq = torch.cat([seq, padding])
+                        padded.append(seq)
+                    collated[key] = torch.stack(padded)
+            
+            return collated
+
         # build dataloader
         rank = self.device_mesh.get_rank()
         world_size = self.device_mesh.size()
@@ -144,7 +182,8 @@ class FSDPSFTTrainer(object):
                                            sampler=self.train_sampler,
                                            num_workers=8,
                                            pin_memory=True,
-                                           drop_last=True)
+                                           drop_last=True,
+                                           collate_fn=collate_fn)
 
         self.val_sampler = DistributedSampler(self.val_dataset,
                                               shuffle=True,
@@ -156,7 +195,8 @@ class FSDPSFTTrainer(object):
                                          sampler=self.val_sampler,
                                          num_workers=8,
                                          pin_memory=True,
-                                         drop_last=True)
+                                         drop_last=True,
+                                         collate_fn=collate_fn)
 
     def _build_model_optimizer(self):
         # TODO (zhangchi.usc1992):

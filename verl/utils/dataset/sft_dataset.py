@@ -98,94 +98,129 @@ class SFTDataset(Dataset):
         self.dataframe = pd.concat(dataframes, ignore_index=True)
         print(f'Loaded {len(self.dataframe)} examples from {len(self.parquet_files)} parquet file(s)')
         
-        # Check required columns exist
-        if self.prompt_key not in self.dataframe.columns:
-            raise ValueError(f"Column '{self.prompt_key}' not found in parquet file. Available columns: {self.dataframe.columns.tolist()}")
-        if self.response_key not in self.dataframe.columns:
-            raise ValueError(f"Column '{self.response_key}' not found in parquet file. Available columns: {self.dataframe.columns.tolist()}")
+        # Check if we have pre-tokenized data
+        self.has_tokenized = all(col in self.dataframe.columns for col in ['input_ids', 'labels', 'attention_mask'])
+        
+        if self.has_tokenized:
+            # Pre-tokenized mode: don't require prompt_key and response_key
+            print("Detected pre-tokenized data (input_ids, labels, attention_mask). Using pre-tokenized mode.")
+        else:
+            # Text mode: require prompt_key and response_key
+            if self.prompt_key not in self.dataframe.columns:
+                raise ValueError(f"Column '{self.prompt_key}' not found in parquet file. Available columns: {self.dataframe.columns.tolist()}")
+            if self.response_key not in self.dataframe.columns:
+                raise ValueError(f"Column '{self.response_key}' not found in parquet file. Available columns: {self.dataframe.columns.tolist()}")
 
     def __len__(self):
         return len(self.dataframe)
 
     def __getitem__(self, item):
         """
-        Get a single example and tokenize it.
+        Get a single example from pre-tokenized data or tokenize from text.
         
         Returns:
-            dict with keys: input_ids, attention_mask, position_ids, loss_mask
+            dict with keys: input_ids, labels, attention_mask, position_ids, loss_mask
         """
         row_dict = self.dataframe.iloc[item].to_dict()
         
-        # Extract prompt and response
-        prompt = row_dict.pop(self.prompt_key)
-        response = row_dict.pop(self.response_key)
-        
-        # Handle dict-style prompts/responses (if needed)
-        if self.prompt_dict_keys is not None:
-            if isinstance(prompt, dict):
-                prompt = ' '.join([prompt.get(k, '') for k in self.prompt_dict_keys])
-        
-        if self.response_dict_keys is not None:
-            if isinstance(response, dict):
-                response = ' '.join([response.get(k, '') for k in self.response_dict_keys])
-        
-        # Convert to string if needed
-        if not isinstance(prompt, str):
-            prompt = str(prompt)
-        if not isinstance(response, str):
-            response = str(response)
-        
-        # Concatenate prompt and response
-        # Format: prompt + response (with EOS token)
-        full_text = prompt + response
-        
-        # Tokenize the full sequence
-        input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(
-            prompt=full_text,
-            tokenizer=self.tokenizer,
-            max_length=self.max_length,
-            pad_token_id=self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id,
-            left_pad=False,  # Right pad for causal LM
-            truncation=self.truncation
-        )
-        
-        # Compute position IDs
-        position_ids = compute_position_id_with_mask(attention_mask)
-        
-        # Create loss mask: 1 for response tokens (to compute loss), 0 for prompt tokens (masked)
-        # We need to tokenize prompt separately to know where response starts
-        prompt_ids, prompt_attention_mask = verl_F.tokenize_and_postprocess_data(
-            prompt=prompt,
-            tokenizer=self.tokenizer,
-            max_length=self.max_length,
-            pad_token_id=self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id,
-            left_pad=False,
-            truncation='right'  # Allow truncation for prompt to find boundary
-        )
-        
-        # Get actual prompt length (excluding padding)
-        prompt_length = prompt_attention_mask[0].sum().item()
-        seq_length = input_ids.shape[1]
-        
-        # Create loss mask: 1 for response tokens (to train), 0 for prompt tokens and padding
-        loss_mask = torch.zeros(seq_length, dtype=torch.float32)
-        
-        # Set mask to 1 for all tokens starting from prompt_length
-        # This means we compute loss on the entire response
-        if prompt_length < seq_length:
-            loss_mask[prompt_length:] = 1.0
-        
-        # Also mask padding tokens (where attention_mask is 0)
-        loss_mask = loss_mask * attention_mask[0].float()
-        
-        result = {
-            'input_ids': input_ids[0],
-            'attention_mask': attention_mask[0],
-            'position_ids': position_ids[0],
-            'loss_mask': loss_mask,
-        }
-        
-        # Add any additional fields from the original row
-        result.update(row_dict)
-        
-        return result
+        # Check if we have pre-tokenized data
+        if self.has_tokenized:
+            # Use pre-tokenized data directly
+            # Convert lists to tensors (make a copy to ensure writable)
+            input_ids = torch.tensor(list(row_dict['input_ids']), dtype=torch.long)
+            labels = torch.tensor(list(row_dict['labels']), dtype=torch.long)
+            attention_mask = torch.tensor(list(row_dict['attention_mask']), dtype=torch.long)
+            
+            # Compute position IDs
+            position_ids = torch.arange(len(input_ids), dtype=torch.long)
+            
+            # Create loss mask from labels (where labels != -100)
+            loss_mask = (labels != -100).float() * attention_mask.float()
+            
+            result = {
+                'input_ids': input_ids,
+                'labels': labels,
+                'attention_mask': attention_mask,
+                'position_ids': position_ids,
+                'loss_mask': loss_mask,
+            }
+            
+            return result
+        else:
+            # Fallback: Extract prompt and response for text-based tokenization
+            prompt = row_dict.pop(self.prompt_key)
+            response = row_dict.pop(self.response_key)
+            
+            # Handle dict-style prompts/responses (if needed)
+            if self.prompt_dict_keys is not None:
+                if isinstance(prompt, dict):
+                    prompt = ' '.join([prompt.get(k, '') for k in self.prompt_dict_keys])
+            
+            if self.response_dict_keys is not None:
+                if isinstance(response, dict):
+                    response = ' '.join([response.get(k, '') for k in self.response_dict_keys])
+            
+            # Convert to string if needed
+            if not isinstance(prompt, str):
+                prompt = str(prompt)
+            if not isinstance(response, str):
+                response = str(response)
+            
+            # Concatenate prompt and response
+            # Format: prompt + response (with EOS token)
+            full_text = prompt + response
+            
+            # Tokenize the full sequence
+            input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(
+                prompt=full_text,
+                tokenizer=self.tokenizer,
+                max_length=self.max_length,
+                pad_token_id=self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id,
+                left_pad=False,  # Right pad for causal LM
+                truncation=self.truncation
+            )
+            
+            # Compute position IDs
+            position_ids = compute_position_id_with_mask(attention_mask)
+            
+            # Create loss mask: 1 for response tokens (to compute loss), 0 for prompt tokens (masked)
+            # We need to tokenize prompt separately to know where response starts
+            prompt_ids, prompt_attention_mask = verl_F.tokenize_and_postprocess_data(
+                prompt=prompt,
+                tokenizer=self.tokenizer,
+                max_length=self.max_length,
+                pad_token_id=self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id,
+                left_pad=False,
+                truncation='right'  # Allow truncation for prompt to find boundary
+            )
+            
+            # Get actual prompt length (excluding padding)
+            prompt_length = prompt_attention_mask[0].sum().item()
+            seq_length = input_ids.shape[1]
+            
+            # Create loss mask: 1 for response tokens (to train), 0 for prompt tokens and padding
+            loss_mask = torch.zeros(seq_length, dtype=torch.float32)
+            
+            # Set mask to 1 for all tokens starting from prompt_length
+            # This means we compute loss on the entire response
+            if prompt_length < seq_length:
+                loss_mask[prompt_length:] = 1.0
+            
+            # Also mask padding tokens (where attention_mask is 0)
+            loss_mask = loss_mask * attention_mask[0].float()
+            
+            # Create labels from input_ids (for compatibility)
+            labels = input_ids[0].clone()
+            
+            result = {
+                'input_ids': input_ids[0],
+                'labels': labels,
+                'attention_mask': attention_mask[0],
+                'position_ids': position_ids[0],
+                'loss_mask': loss_mask,
+            }
+            
+            # Add any additional fields from the original row
+            result.update(row_dict)
+            
+            return result
