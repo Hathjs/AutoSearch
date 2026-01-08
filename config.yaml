@@ -1,0 +1,52 @@
+# AutoSearch Configuration
+# Simplified from tool_sketch/config.yaml
+
+global:
+  project_root: .
+  data_root: data
+
+# API Key Pool Configuration
+# Keys are rotated round-robin by the generator script
+api_key_list:
+  - key_id: main_key_1
+    api_key: "2004474851080138762"
+    base_url: https://aigc.sankuai.com/v1/openai/native
+    description: "Main API key 1"
+  - key_id: main_key_2
+    api_key: "2004474899070656607"
+    base_url: https://aigc.sankuai.com/v1/openai/native
+    description: "Main API key 2"
+  - key_id: main_key_3
+    api_key: "2004474866040889391"
+    base_url: https://aigc.sankuai.com/v1/openai/native
+    description: "Main API key 3"
+  - key_id: main_key_4
+    api_key: "2004474880758530095"
+    base_url: https://aigc.sankuai.com/v1/openai/native
+    description: "Main API key 4"
+
+# LLM Backend Configurations
+llm_backends:
+  deepseek_main:
+    base_url: https://aigc.sankuai.com/v1/openai/native
+    model: deepseek-chat
+    temperature: 0.7
+    max_context_tokens: 32000
+    max_response_tokens: 8192
+    timeout_seconds: 180
+    rpm: 50
+
+  gpt4_main:
+    base_url: https://aigc.sankuai.com/v1/openai/native
+    model: gpt-4
+    temperature: 0.7
+    max_context_tokens: 32000
+    max_response_tokens: 8192
+    timeout_seconds: 180
+    rpm: 50
+
+# Execution Configuration
+execution:
+  max_concurrent: 10  # Moderate concurrency to be safe
+  max_retries: 3
+  retry_delay: 5

@@ -31,7 +31,6 @@ import os
 import json
 import datasets
 from transformers import AutoTokenizer
-import torch
 import numpy as np
 
 from verl.utils.hdfs_io import copy, makedirs
@@ -81,17 +80,24 @@ Question: {question}\n"""
     return prefix
 
 
-def find_memory_spans(text):
+def find_system_feedback_spans(text):
     """
-    Find all <memory>...</memory> spans in the text.
+    Find all system feedback spans in the text.
+    Includes both <memory>...</memory> and <information>...</information>.
     
     Returns:
-        List of (start_char, end_char) tuples for each memory block
+        List of (start_char, end_char) tuples for each block
     """
-    pattern = r'<memory>(.*?)</memory>'
     spans = []
-    for match in re.finditer(pattern, text, re.DOTALL):
+    
+    # Pattern for memory blocks
+    for match in re.finditer(r'<memory>(.*?)</memory>', text, re.DOTALL):
         spans.append((match.start(), match.end()))
+        
+    # Pattern for information blocks (search results)
+    for match in re.finditer(r'<information>(.*?)</information>', text, re.DOTALL):
+        spans.append((match.start(), match.end()))
+        
     return spans
 
 
@@ -116,8 +122,8 @@ def create_label_mask_with_offsets(input_ids, offset_mapping, full_text, assista
     # Initialize labels with input_ids (will mask later)
     labels = input_ids.copy()
     
-    # Find memory spans in the full text
-    memory_spans = find_memory_spans(full_text)
+    # Find system feedback spans (memory + information)
+    feedback_spans = find_system_feedback_spans(full_text)
     
     # Mask 1: System prompt + User query (everything before assistant response)
     # offset_mapping is a list of (char_start, char_end) tuples
@@ -133,15 +139,15 @@ def create_label_mask_with_offsets(input_ids, offset_mapping, full_text, assista
         if char_end <= assistant_start_char:
             labels[token_idx] = -100
     
-    # Mask 2: Memory content blocks
-    for mem_start_char, mem_end_char in memory_spans:
+    # Mask 2: System feedback content blocks
+    for start_char, end_char in feedback_spans:
         for token_idx, (char_start, char_end) in enumerate(offset_mapping):
             if char_start is None or char_end is None:
                 continue
             
-            # Check if this token overlaps with memory span
-            # Token overlaps if it's not completely before or after the memory span
-            if not (char_end <= mem_start_char or char_start >= mem_end_char):
+            # Check if this token overlaps with feedback span
+            # Token overlaps if it's not completely before or after the span
+            if not (char_end <= start_char or char_start >= end_char):
                 labels[token_idx] = -100
     
     return labels
@@ -169,8 +175,8 @@ def debug_print_tokenization(tokenizer, input_ids, labels, full_text, assistant_
         token_str = tokenizer.decode([token_id], skip_special_tokens=False)
         decoded_tokens.append(token_str)
     
-    # Find memory spans
-    memory_spans = find_memory_spans(full_text)
+    # Find feedback spans
+    feedback_spans = find_system_feedback_spans(full_text)
     
     # Print system prompt section
     print("\n[System Prompt + User Query] (MASKED - Loss=0):")
@@ -203,16 +209,23 @@ def debug_print_tokenization(tokenizer, input_ids, labels, full_text, assistant_
         # Get the actual text for this token
         token_text = full_text[char_start:char_end] if char_start < len(full_text) else decoded_tokens[i]
         
-        # Check if this is part of memory
-        in_memory = False
-        for mem_start, mem_end in memory_spans:
-            if not (char_end <= mem_start or char_start >= mem_end):
-                in_memory = True
+        # Check if this is part of feedback
+        in_feedback = False
+        tag_type = ""
+        for start, end in feedback_spans:
+            if not (char_end <= start or char_start >= end):
+                in_feedback = True
+                # Identify tag type for display
+                span_text = full_text[start:end]
+                if span_text.startswith("<memory>"):
+                    tag_type = "memory"
+                elif span_text.startswith("<information>"):
+                    tag_type = "information"
                 break
         
         # Format output
-        if in_memory:
-            print(f"[Token {i:4d}] {token_text[:30]:30s} | Label: {label:6d} | {mask_status} | <memory> content")
+        if in_feedback:
+            print(f"[Token {i:4d}] {token_text[:30]:30s} | Label: {label:6d} | {mask_status} | <{tag_type}> content")
         else:
             print(f"[Token {i:4d}] {token_text[:30]:30s} | Label: {label:6d} | {mask_status}")
         
