@@ -38,7 +38,7 @@ trainer:
   resume_path: null
   project_name: autosearch-sft
   experiment_name: qwen2.5-3b-v1
-  total_epochs: 1
+  total_epochs: 3
   total_training_steps: null
   validate_before_training: False
   logger: ['console']  # Change to ['console', 'wandb'] if wandb is configured
