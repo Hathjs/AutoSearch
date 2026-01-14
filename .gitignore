@@ -122,3 +122,13 @@ log/
 **logs
 
 hope-run/
+
+# Core dump files (进程崩溃时的内存转储，通常很大，会影响Git性能)
+core.*
+core
+*.core
+
+# Metals (Scala language server) cache files
+.metals/
+metals.*
+*.metals
