@@ -21,6 +21,9 @@ model:
   external_lib: null
   enable_gradient_checkpointing: False
   trust_remote_code: True
+  # Attention implementation: 'flash_attention_2' (fast, but may have compatibility issues),
+  # 'sdpa' (PyTorch standard, more stable), or None (use model default)
+  attn_implementation: 'sdpa'  # Changed to 'sdpa' to avoid Flash Attention SIGFPE issues
   lora_rank: 0  # Set to positive value to enable LoRA (e.g., 32)
   lora_alpha: 16  # LoRA scaling factor
   target_modules: [q_proj, v_proj]  # Target modules for LoRA adaptation
