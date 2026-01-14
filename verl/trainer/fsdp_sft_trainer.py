@@ -296,8 +296,27 @@ class FSDPSFTTrainer(object):
                                                             num_training_steps=total_steps)
 
     def _compute_loss(self, batch):
+        # 检查 batch 是否为空或异常
+        if 'loss_mask' not in batch:
+            rank = self.device_mesh.get_rank() if hasattr(self, 'device_mesh') else 0
+            logger.error(f"Rank {rank}: Missing 'loss_mask' in batch!")
+            return torch.tensor(0.0, device=torch.cuda.current_device(), dtype=torch.float32)
+        
+        # 检查序列长度，避免切片后得到空 tensor
+        seq_length = batch['loss_mask'].shape[1]
+        if seq_length <= 1:
+            rank = self.device_mesh.get_rank() if hasattr(self, 'device_mesh') else 0
+            logger.warning(f"Rank {rank}: Sequence length is {seq_length}, too short for loss computation. Returning 0.0")
+            return torch.tensor(0.0, device=torch.cuda.current_device(), dtype=torch.float32)
+        
         loss_mask = batch.pop('loss_mask')[:, :-1].reshape(-1).cuda()
         labels = batch['input_ids'][:, 1:].cuda()
+        
+        # 检查 loss_mask 是否为空
+        if loss_mask.numel() == 0:
+            rank = self.device_mesh.get_rank() if hasattr(self, 'device_mesh') else 0
+            logger.warning(f"Rank {rank}: loss_mask is empty after slicing. Returning 0.0")
+            return torch.tensor(0.0, device=torch.cuda.current_device(), dtype=torch.float32)
 
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             output = self.fsdp_model(input_ids=batch['input_ids'],
@@ -316,6 +335,13 @@ class FSDPSFTTrainer(object):
         # Enable model parallelism
         shift_labels = shift_labels.to(shift_logits.device)
         loss = loss_fct(shift_logits, shift_labels)
+        
+        # 确保 loss 和 loss_mask 的 shape 匹配
+        if loss.shape != loss_mask.shape:
+            rank = self.device_mesh.get_rank() if hasattr(self, 'device_mesh') else 0
+            logger.error(f"Rank {rank}: Shape mismatch! loss.shape={loss.shape}, loss_mask.shape={loss_mask.shape}")
+            return torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+        
         loss = loss * loss_mask
 
         valid_token_this_rank = torch.sum(loss_mask)
@@ -510,21 +536,41 @@ class FSDPSFTTrainer(object):
                     return
 
             # validation
+            if rank == 0:
+                print(f"Starting validation after epoch {epoch + 1}...")
             val_losses = []
-            for data in self.val_dataloader:
-                data = TensorDict(data, batch_size=self.config.data.micro_batch_size).cuda()
-                val_loss = self.validation_step(data)
-                # 确保val_loss是tensor类型
-                if isinstance(val_loss, torch.Tensor):
-                    val_losses.append(val_loss)
-                else:
-                    val_losses.append(torch.tensor(val_loss, device=torch.cuda.current_device()))
+            for batch_idx, data in enumerate(self.val_dataloader):
+                try:
+                    data = TensorDict(data, batch_size=self.config.data.micro_batch_size).cuda()
+                    # 检查 batch 是否为空
+                    if len(data) == 0:
+                        if rank == 0:
+                            logger.warning(f"Validation batch {batch_idx} is empty, skipping")
+                        continue
+                    val_loss = self.validation_step(data)
+                    # 确保val_loss是tensor类型
+                    if isinstance(val_loss, torch.Tensor):
+                        # 检查是否为 NaN 或 Inf
+                        if torch.isnan(val_loss) or torch.isinf(val_loss):
+                            if rank == 0:
+                                logger.warning(f"Validation batch {batch_idx} produced NaN/Inf loss, skipping")
+                            continue
+                        val_losses.append(val_loss)
+                    else:
+                        val_losses.append(torch.tensor(val_loss, device=torch.cuda.current_device()))
+                except Exception as e:
+                    if rank == 0:
+                        logger.error(f"Error processing validation batch {batch_idx}: {e}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+                    continue
             
             if len(val_losses) > 0:
                 if rank == 0:
                     val_loss = torch.mean(torch.stack(val_losses))
                     metric = {'val/loss': val_loss.detach().item()}
                     tracking.log(data=metric, step=global_step)
+                    print(f"Validation loss after epoch {epoch + 1}: {val_loss.detach().item():.4f}")
             else:
                 if rank == 0:
                     logger.warning("No validation losses collected, skipping validation logging")
