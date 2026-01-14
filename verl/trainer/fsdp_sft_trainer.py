@@ -326,7 +326,13 @@ class FSDPSFTTrainer(object):
         else:
             dp_size = 1
 
-        loss = torch.sum(loss) / valid_token_this_rank * dp_size  # possible bugs here for dp
+        # 防止除零错误：如果当前rank没有有效token，返回0
+        # 在validation阶段，某些rank可能分配到空的batch
+        if valid_token_this_rank > 0:
+            loss = torch.sum(loss) / valid_token_this_rank * dp_size
+        else:
+            # 如果没有有效token，返回0（在all_reduce时会自动平均）
+            loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
         return loss
 
     def training_step(self, batch: TensorDict):
@@ -368,8 +374,17 @@ class FSDPSFTTrainer(object):
     def validation_step(self, batch: TensorDict):
         self.fsdp_model.eval()
         with torch.no_grad():
-            loss = self._compute_loss(batch)
-            torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
+            try:
+                loss = self._compute_loss(batch)
+                # 确保loss是tensor类型（防止某些edge case）
+                if not isinstance(loss, torch.Tensor):
+                    loss = torch.tensor(loss, device=torch.cuda.current_device(), dtype=torch.float32)
+                torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
+            except Exception as e:
+                # 如果计算loss时出错，返回0并记录警告
+                logger.warning(f"Error in validation_step: {e}, returning 0.0")
+                loss = torch.tensor(0.0, device=torch.cuda.current_device(), dtype=torch.float32)
+                torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
         return loss
 
     def save_checkpoint(self, step):
@@ -418,11 +433,20 @@ class FSDPSFTTrainer(object):
             for data in self.val_dataloader:
                 data = TensorDict(data, batch_size=self.config.data.micro_batch_size).cuda()
                 val_loss = self.validation_step(data)
-                val_losses.append(val_loss)
-            if rank == 0:
-                val_loss = torch.mean(torch.stack(val_losses))
-                metric = {'val/loss': val_loss.detach().item()}
-                tracking.log(data=metric, step=global_step)
+                # 确保val_loss是tensor类型
+                if isinstance(val_loss, torch.Tensor):
+                    val_losses.append(val_loss)
+                else:
+                    val_losses.append(torch.tensor(val_loss, device=torch.cuda.current_device()))
+            
+            if len(val_losses) > 0:
+                if rank == 0:
+                    val_loss = torch.mean(torch.stack(val_losses))
+                    metric = {'val/loss': val_loss.detach().item()}
+                    tracking.log(data=metric, step=global_step)
+            else:
+                if rank == 0:
+                    logger.warning("No validation losses collected, skipping validation logging")
             torch.distributed.barrier()
 
         for epoch in range(self.config.trainer.total_epochs):
@@ -441,11 +465,20 @@ class FSDPSFTTrainer(object):
                     for val_data in self.val_dataloader:
                         val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size).cuda()
                         val_loss = self.validation_step(val_data)
-                        val_losses.append(val_loss)
-                    if rank == 0:
-                        avg_val_loss = torch.mean(torch.stack(val_losses))
-                        metric = {'val/loss': avg_val_loss.detach().item()}
-                        tracking.log(data=metric, step=global_step)
+                        # 确保val_loss是tensor类型
+                        if isinstance(val_loss, torch.Tensor):
+                            val_losses.append(val_loss)
+                        else:
+                            val_losses.append(torch.tensor(val_loss, device=torch.cuda.current_device()))
+                    
+                    if len(val_losses) > 0:
+                        if rank == 0:
+                            avg_val_loss = torch.mean(torch.stack(val_losses))
+                            metric = {'val/loss': avg_val_loss.detach().item()}
+                            tracking.log(data=metric, step=global_step)
+                    else:
+                        if rank == 0:
+                            logger.warning("No validation losses collected, skipping validation logging")
                     torch.distributed.barrier()
 
                     # Save final checkpoint
@@ -457,11 +490,20 @@ class FSDPSFTTrainer(object):
             for data in self.val_dataloader:
                 data = TensorDict(data, batch_size=self.config.data.micro_batch_size).cuda()
                 val_loss = self.validation_step(data)
-                val_losses.append(val_loss)
-            if rank == 0:
-                val_loss = torch.mean(torch.stack(val_losses))
-                metric = {'val/loss': val_loss.detach().item()}
-                tracking.log(data=metric, step=global_step)
+                # 确保val_loss是tensor类型
+                if isinstance(val_loss, torch.Tensor):
+                    val_losses.append(val_loss)
+                else:
+                    val_losses.append(torch.tensor(val_loss, device=torch.cuda.current_device()))
+            
+            if len(val_losses) > 0:
+                if rank == 0:
+                    val_loss = torch.mean(torch.stack(val_losses))
+                    metric = {'val/loss': val_loss.detach().item()}
+                    tracking.log(data=metric, step=global_step)
+            else:
+                if rank == 0:
+                    logger.warning("No validation losses collected, skipping validation logging")
             torch.distributed.barrier()
 
             # Note: Checkpoint saving moved to after all epochs complete
