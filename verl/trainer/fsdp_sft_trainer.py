@@ -438,11 +438,16 @@ class FSDPSFTTrainer(object):
                         rank = self.device_mesh.get_rank() if hasattr(self, 'device_mesh') else 0
                         logger.warning(f"Rank {rank}: Loss is NaN or Inf, replacing with 0.0")
                         loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
-                # 这里避免使用 ReduceOp.AVG：在某些环境/类型组合下可能触发底层 SIGFPE
-                # 改为 SUM + 手动除以 world_size，并强制 float32 做规约
-                loss = loss.float()
-                torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.SUM)
-                loss = loss / torch.distributed.get_world_size()
+                # 可选：validation 阶段是否做跨 rank 规约
+                # 现象：SIGFPE 固定发生在 “Starting validation...” 后，强烈怀疑是通信规约触发底层异常
+                # 用该开关可快速验证是不是 all_reduce 导致（先跑通训练再进一步定位）
+                do_val_all_reduce = bool(self.config.trainer.get('val_all_reduce', True))
+                if do_val_all_reduce:
+                    # 避免 ReduceOp.AVG：在某些环境/类型组合下可能触发底层 SIGFPE
+                    # 改为 SUM + 手动除以 world_size，并强制 float32 做规约
+                    loss = loss.float()
+                    torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.SUM)
+                    loss = loss / torch.distributed.get_world_size()
             except Exception as e:
                 # 如果计算loss时出错，返回0并记录警告
                 rank = self.device_mesh.get_rank() if hasattr(self, 'device_mesh') else 0
@@ -450,8 +455,10 @@ class FSDPSFTTrainer(object):
                 import traceback
                 logger.error(traceback.format_exc())
                 loss = torch.tensor(0.0, device=torch.cuda.current_device(), dtype=torch.float32)
-                torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.SUM)
-                loss = loss / torch.distributed.get_world_size()
+                do_val_all_reduce = bool(self.config.trainer.get('val_all_reduce', True))
+                if do_val_all_reduce:
+                    torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.SUM)
+                    loss = loss / torch.distributed.get_world_size()
         return loss
 
     def save_checkpoint(self, step):
