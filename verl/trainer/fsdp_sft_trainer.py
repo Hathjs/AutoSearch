@@ -438,7 +438,11 @@ class FSDPSFTTrainer(object):
                         rank = self.device_mesh.get_rank() if hasattr(self, 'device_mesh') else 0
                         logger.warning(f"Rank {rank}: Loss is NaN or Inf, replacing with 0.0")
                         loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
-                torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
+                # 这里避免使用 ReduceOp.AVG：在某些环境/类型组合下可能触发底层 SIGFPE
+                # 改为 SUM + 手动除以 world_size，并强制 float32 做规约
+                loss = loss.float()
+                torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.SUM)
+                loss = loss / torch.distributed.get_world_size()
             except Exception as e:
                 # 如果计算loss时出错，返回0并记录警告
                 rank = self.device_mesh.get_rank() if hasattr(self, 'device_mesh') else 0
@@ -446,7 +450,8 @@ class FSDPSFTTrainer(object):
                 import traceback
                 logger.error(traceback.format_exc())
                 loss = torch.tensor(0.0, device=torch.cuda.current_device(), dtype=torch.float32)
-                torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
+                torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.SUM)
+                loss = loss / torch.distributed.get_world_size()
         return loss
 
     def save_checkpoint(self, step):
