@@ -328,10 +328,20 @@ class FSDPSFTTrainer(object):
 
         # 防止除零错误：如果当前rank没有有效token，返回0
         # 在validation阶段，某些rank可能分配到空的batch
-        if valid_token_this_rank > 0:
-            loss = torch.sum(loss) / valid_token_this_rank * dp_size
+        # 使用 .item() 确保是 Python 标量，添加 epsilon 防止数值精度问题
+        valid_token_count = valid_token_this_rank.item() if valid_token_this_rank.numel() == 1 else float(valid_token_this_rank)
+        epsilon = 1e-8
+        
+        if valid_token_count > epsilon:
+            # 使用 epsilon 防止数值精度问题导致的除零
+            loss = torch.sum(loss) / (valid_token_this_rank + epsilon) * dp_size
         else:
             # 如果没有有效token，返回0（在all_reduce时会自动平均）
+            # 记录警告以便调试（只在 rank 0 打印，避免日志过多）
+            rank = self.device_mesh.get_rank() if hasattr(self, 'device_mesh') else 0
+            if rank == 0:
+                logger.warning(f"Warning: valid_token_this_rank is {valid_token_count}, returning 0.0 loss. "
+                             f"This may indicate empty batch or all tokens masked.")
             loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
         return loss
 
@@ -375,14 +385,28 @@ class FSDPSFTTrainer(object):
         self.fsdp_model.eval()
         with torch.no_grad():
             try:
-                loss = self._compute_loss(batch)
-                # 确保loss是tensor类型（防止某些edge case）
-                if not isinstance(loss, torch.Tensor):
-                    loss = torch.tensor(loss, device=torch.cuda.current_device(), dtype=torch.float32)
+                # 检查 batch 是否为空或异常
+                if 'loss_mask' not in batch:
+                    rank = self.device_mesh.get_rank() if hasattr(self, 'device_mesh') else 0
+                    logger.error(f"Rank {rank}: Missing 'loss_mask' in validation batch!")
+                    loss = torch.tensor(0.0, device=torch.cuda.current_device(), dtype=torch.float32)
+                else:
+                    loss = self._compute_loss(batch)
+                    # 确保loss是tensor类型（防止某些edge case）
+                    if not isinstance(loss, torch.Tensor):
+                        loss = torch.tensor(loss, device=torch.cuda.current_device(), dtype=torch.float32)
+                    # 检查 loss 是否为 NaN 或 Inf
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        rank = self.device_mesh.get_rank() if hasattr(self, 'device_mesh') else 0
+                        logger.warning(f"Rank {rank}: Loss is NaN or Inf, replacing with 0.0")
+                        loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
                 torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
             except Exception as e:
                 # 如果计算loss时出错，返回0并记录警告
-                logger.warning(f"Error in validation_step: {e}, returning 0.0")
+                rank = self.device_mesh.get_rank() if hasattr(self, 'device_mesh') else 0
+                logger.error(f"Rank {rank}: Error in validation_step: {e}, returning 0.0")
+                import traceback
+                logger.error(traceback.format_exc())
                 loss = torch.tensor(0.0, device=torch.cuda.current_device(), dtype=torch.float32)
                 torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
         return loss
