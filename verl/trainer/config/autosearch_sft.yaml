@@ -2,8 +2,8 @@
 data:
   train_batch_size: 64
   micro_batch_size: 32  # gradient accumulation steps = train_batch_size / micro_batch_size (must be divisible by dp_size=8)
-  train_files: /home/hadoop-ai-search/dolphinfs_ssd_hadoop-ai-search/chenqing30/cqproject/autosearch/data/autosearch_sft_processed/train.parquet
-  val_files: /home/hadoop-ai-search/dolphinfs_ssd_hadoop-ai-search/chenqing30/cqproject/autosearch/data/autosearch_sft_processed/val.parquet
+  train_files: /mnt/dolphinfs/ssd_pool/docker/user/hadoop-ai-search/chenqing30/cqproject/autosearch/data/autosearch_sft_processed/train.parquet
+  val_files: /mnt/dolphinfs/ssd_pool/docker/user/hadoop-ai-search/chenqing30/cqproject/autosearch/data/autosearch_sft_processed/val.parquet
   prompt_key: question  # column name in parquet for prompt
   response_key: answer  # column name in parquet for response
   max_length: 4096
@@ -12,7 +12,7 @@ data:
   chat_template: null
 
 model:
-  partial_pretrain: /home/hadoop-ai-search/dolphinfs_ssd_hadoop-ai-search/chongwenyue/model/Qwen2.5-3B-Instruct
+  partial_pretrain: /mnt/dolphinfs/ssd_pool/docker/user/hadoop-ai-search/chongwenyue/model/Qwen2.5-3B-Instruct
   fsdp_config:
     wrap_policy:
       min_num_params: 0
@@ -33,7 +33,7 @@ optim:
   clip_grad: 1.0
 
 trainer:
-  default_local_dir: ./checkpoints/autosearch_sft
+  default_local_dir: ./checkpoints/autosearch_sft_outdata
   default_hdfs_dir: null  # Set to HDFS path if needed
   resume_path: null
   project_name: autosearch-sft
