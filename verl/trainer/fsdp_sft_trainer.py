@@ -219,10 +219,22 @@ class FSDPSFTTrainer(object):
         init_context = get_init_weight_context_manager(use_meta_tensor=not config.tie_word_embeddings)
 
         with init_context():
+            # 根据配置选择 attention 实现
+            # 'flash_attention_2': 最快，但可能有兼容性问题
+            # 'sdpa': PyTorch 标准实现，更稳定
+            # None: 使用模型默认实现
+            attn_impl = self.config.model.get('attn_implementation', 'sdpa')
+            if attn_impl == 'flash_attention_2':
+                logger.info("Using Flash Attention 2.0 (fast but may have compatibility issues)")
+            elif attn_impl == 'sdpa':
+                logger.info("Using SDPA (PyTorch standard attention, more stable)")
+            else:
+                logger.info(f"Using default attention implementation: {attn_impl}")
+            
             self.model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(local_model_path,
                                                                                config=config,
                                                                                torch_dtype=torch.bfloat16,
-                                                                               attn_implementation='flash_attention_2',
+                                                                               attn_implementation=attn_impl,
                                                                                trust_remote_code=trust_remote_code)
             if self.config.model.get('lora_rank', 0) > 0:
                 if not PEFT_AVAILABLE:
