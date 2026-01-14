@@ -1,6 +1,13 @@
 #!/bin/bash
 # AutoSearch SFT Training Script
 
+# 禁用core dump（避免生成大文件影响IO）
+ulimit -c 0
+
+# 增加NCCL超时时间（单位：秒），应对网络文件系统IO慢的情况
+# 默认600秒，设置为20分钟（1200秒）比较合理
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=1200
+
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 export WAND_PROJECT='AutoSearch-SFT'
