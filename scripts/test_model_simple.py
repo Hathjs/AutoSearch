@@ -43,15 +43,25 @@ def test_model_simple(model_path: str, question: str = "1+1等于几？", max_ne
     try:
         # Try to load with specific dtype and disable flash attention to avoid issues
         # Flash Attention requires float16/bfloat16, but may cause hangs if not properly configured
-        print("  Attempting to load with float16 and disabled flash attention...")
-        
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            trust_remote_code=True,
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-            device_map="auto" if device == "cuda" else None,
-            attn_implementation="eager",  # Disable Flash Attention, use eager implementation
-        )
+        if device == "cuda":
+            print("  Loading with float16 and disabled flash attention (eager mode)...")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                trust_remote_code=True,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                attn_implementation="eager",  # CRITICAL: Disable Flash Attention to avoid hangs
+            )
+        else:
+            print("  Loading with float32 (CPU mode)...")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                trust_remote_code=True,
+                torch_dtype=torch.float32,
+                device_map=None,
+                attn_implementation="eager",
+            )
+            model = model.to(device)
         if device == "cpu":
             model = model.to(device)
         model.eval()

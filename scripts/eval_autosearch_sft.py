@@ -227,12 +227,19 @@ def evaluate_model(
     
     print(f"Loading model from {model_path}...")
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    # Disable Flash Attention to avoid hangs (use eager implementation instead)
+    # Flash Attention requires specific dtype/device configuration and may cause hangs
+    print("  Loading with eager attention (Flash Attention disabled)...")
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        device_map="auto" if device == "cuda" else None,
+        trust_remote_code=True,
+        attn_implementation="eager",  # CRITICAL: Disable Flash Attention to avoid hangs
     )
+    if device == "cpu":
+        model = model.to(device)
     
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
