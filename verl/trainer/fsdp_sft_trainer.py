@@ -504,13 +504,21 @@ class FSDPSFTTrainer(object):
         path = os.path.join(self.config.trainer.default_local_dir, f'global_step_{step}')
         # save huggingface model
         if self.device_mesh.get_rank() == 0:
+            print(f'[Rank 0] Creating checkpoint directory: {path}')
             os.makedirs(path, exist_ok=True)
+            print(f'[Rank 0] Saving model to {path}...')
             self.model.save_pretrained(path, state_dict=state_dict)
+            print(f'[Rank 0] Saving tokenizer to {path}...')
             self.tokenizer.save_pretrained(path)
+            print(f'[Rank 0] Checkpoint saved successfully to {path}')
             if self.config.trainer.default_hdfs_dir:
+                print(f'[Rank 0] Uploading checkpoint to HDFS: {self.config.trainer.default_hdfs_dir}...')
                 hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
                 hdfs_io.copy(src=path, dst=self.config.trainer.default_hdfs_dir, dirs_exist_ok=True)
+                print(f'[Rank 0] Checkpoint uploaded to HDFS successfully')
         torch.distributed.barrier()
+        if self.device_mesh.get_rank() == 0:
+            print(f'[Rank 0] Checkpoint saving completed. All ranks synchronized.')
 
     def fit(self):
         rank = self.device_mesh.get_rank()
