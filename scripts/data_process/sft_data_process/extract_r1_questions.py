@@ -6,11 +6,13 @@ This script reads the parquet files and extracts (question, golden_answer) pairs
 
 import json
 import argparse
+import random
+from collections import defaultdict, Counter
 from datasets import Dataset
 from pathlib import Path
 
 
-def extract_from_parquet(parquet_path: str, output_path: str, max_samples: int = None):
+def extract_from_parquet(parquet_path: str, output_path: str, max_samples: int = None, stratify: bool = True, seed: int = 42):
     """
     Extract questions and golden answers from parquet file.
     
@@ -18,7 +20,11 @@ def extract_from_parquet(parquet_path: str, output_path: str, max_samples: int =
         parquet_path: Path to input parquet file
         output_path: Path to output JSONL file
         max_samples: Maximum number of samples to extract (None for all)
+        stratify: Whether to stratify sampling by data_source (default: True)
+        seed: Random seed for reproducibility
     """
+    random.seed(seed)
+    
     print(f"Loading parquet from {parquet_path}...")
     dataset = Dataset.from_parquet(parquet_path)
     
@@ -31,8 +37,10 @@ def extract_from_parquet(parquet_path: str, output_path: str, max_samples: int =
         sample = dataset[0]
         print(json.dumps(sample, indent=2, ensure_ascii=False, default=str)[:500])
     
-    samples = []
+    # First pass: collect all samples grouped by data_source
+    samples_by_source = defaultdict(list)
     
+    print("\nExtracting samples...")
     for idx, example in enumerate(dataset):
         # Extract question from prompt
         prompt = example.get('prompt', [])
@@ -95,15 +103,72 @@ def extract_from_parquet(parquet_path: str, output_path: str, max_samples: int =
             print(f"Warning: Sample {idx} has empty question or answer, skipping")
             continue
         
-        samples.append({
+        data_source = example.get('data_source', 'unknown')
+        
+        samples_by_source[data_source].append({
             'question': question,
             'golden_answer': golden_answer,
             'index': idx,
-            'data_source': example.get('data_source', 'unknown')
+            'data_source': data_source
         })
+    
+    # Print data source distribution
+    print(f"\nData source distribution in dataset:")
+    for source, samples_list in samples_by_source.items():
+        print(f"  {source}: {len(samples_list)} samples")
+    
+    # Stratified sampling
+    if stratify and max_samples and len(samples_by_source) > 1:
+        print(f"\nStratified sampling {max_samples} samples...")
         
-        if max_samples and len(samples) >= max_samples:
-            break
+        # Calculate samples per source (proportional)
+        total_samples = sum(len(samples_list) for samples_list in samples_by_source.values())
+        samples = []
+        
+        for source, samples_list in samples_by_source.items():
+            # Calculate proportional sample size
+            source_ratio = len(samples_list) / total_samples
+            source_max = max(1, int(max_samples * source_ratio))
+            
+            # Shuffle and sample
+            random.shuffle(samples_list)
+            sampled = samples_list[:source_max]
+            samples.extend(sampled)
+            print(f"  {source}: sampled {len(sampled)}/{len(samples_list)} samples")
+        
+        # If we have fewer samples than requested, fill from remaining
+        if len(samples) < max_samples:
+            remaining_needed = max_samples - len(samples)
+            all_remaining = []
+            for source, samples_list in samples_by_source.items():
+                # Get samples not yet selected
+                selected_indices = {s['index'] for s in samples}
+                remaining = [s for s in samples_list if s['index'] not in selected_indices]
+                all_remaining.extend(remaining)
+            
+            random.shuffle(all_remaining)
+            samples.extend(all_remaining[:remaining_needed])
+            print(f"  Added {min(remaining_needed, len(all_remaining))} more samples to reach {max_samples}")
+        
+        # Shuffle final samples
+        random.shuffle(samples)
+        samples = samples[:max_samples]  # Ensure we don't exceed max_samples
+        
+    elif max_samples:
+        # Simple sampling without stratification
+        print(f"\nSampling {max_samples} samples (no stratification)...")
+        all_samples = []
+        for samples_list in samples_by_source.values():
+            all_samples.extend(samples_list)
+        
+        random.shuffle(all_samples)
+        samples = all_samples[:max_samples]
+    else:
+        # No max_samples, return all
+        samples = []
+        for samples_list in samples_by_source.values():
+            samples.extend(samples_list)
+        random.shuffle(samples)
     
     print(f"\nExtracted {len(samples)} valid samples")
     
@@ -144,10 +209,16 @@ def main():
                         help='Output JSONL file path')
     parser.add_argument('--max_samples', type=int, default=None,
                         help='Maximum number of samples to extract (default: all)')
+    parser.add_argument('--stratify', action='store_true', default=True,
+                        help='Stratify sampling by data_source (default: True)')
+    parser.add_argument('--no_stratify', dest='stratify', action='store_false',
+                        help='Do not stratify sampling')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed for reproducibility (default: 42)')
     
     args = parser.parse_args()
     
-    extract_from_parquet(args.input, args.output, args.max_samples)
+    extract_from_parquet(args.input, args.output, args.max_samples, args.stratify, args.seed)
 
 
 if __name__ == '__main__':
