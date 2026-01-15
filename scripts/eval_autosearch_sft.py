@@ -256,7 +256,11 @@ def evaluate_model(
                 
                 # Generate with stopping criteria
                 print(f"[Generating (max_new_tokens={max_new_tokens})... This may take 10-60 seconds...]")
+                print(f"[GPU Memory Check: {torch.cuda.memory_allocated()/1024**3:.2f}GB allocated, {torch.cuda.memory_reserved()/1024**3:.2f}GB reserved]")
                 sys.stdout.flush()  # Force flush output
+                
+                import time
+                start_time = time.time()
                 
                 try:
                     with torch.no_grad():
@@ -270,7 +274,8 @@ def evaluate_model(
                             do_sample=temperature > 0,
                             temperature=temperature if temperature > 0 else None,
                         )
-                    print(f"[Generation completed. Output length: {outputs.shape[1]} tokens]")
+                    elapsed = time.time() - start_time
+                    print(f"[Generation completed in {elapsed:.1f}s. Output length: {outputs.shape[1]} tokens]")
                 except KeyboardInterrupt:
                     print("\n[Generation interrupted by user]")
                     raise
