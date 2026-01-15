@@ -15,6 +15,22 @@ import requests
 import signal
 import sys
 import threading
+import time
+
+def check_cuda_status():
+    """Check CUDA device status and memory usage"""
+    if not torch.cuda.is_available():
+        return "CUDA not available"
+    
+    try:
+        # Try to synchronize - if this hangs, CUDA operations are blocked
+        torch.cuda.synchronize()
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        return f"CUDA OK - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB"
+    except Exception as e:
+        return f"CUDA ERROR: {e}"
+
 
 def make_prefix(question: str) -> str:
     """Generate system prompt for AutoSearch V2."""
@@ -222,18 +238,32 @@ def evaluate_model(
         tokenizer.pad_token = tokenizer.eos_token
     
     # Clear default generation config to avoid conflicts with our explicit parameters
-    if hasattr(model, 'generation_config'):
-        # Reset sampling parameters to None so they don't interfere
-        # Use setattr to ensure the values are actually set
-        try:
-            model.generation_config.temperature = None
-            model.generation_config.top_p = None
-            model.generation_config.top_k = None
-            # Also try to set do_sample to None if possible
-            if hasattr(model.generation_config, 'do_sample'):
-                model.generation_config.do_sample = None
-        except Exception as e:
-            print(f"[WARNING] Could not clear generation_config: {e}")
+    # Create a fresh GenerationConfig to override defaults
+    try:
+        from transformers import GenerationConfig
+        # Create a minimal config that will be overridden by gen_kwargs
+        model.generation_config = GenerationConfig(
+            do_sample=False,  # Default to greedy decoding
+            temperature=None,
+            top_p=None,
+            top_k=None,
+        )
+        print(f"[INFO] Reset generation_config to minimal config")
+    except Exception as e:
+        print(f"[WARNING] Could not reset generation_config: {e}")
+        # Fallback: try to clear individual attributes
+        if hasattr(model, 'generation_config'):
+            try:
+                if hasattr(model.generation_config, 'temperature'):
+                    model.generation_config.temperature = None
+                if hasattr(model.generation_config, 'top_p'):
+                    model.generation_config.top_p = None
+                if hasattr(model.generation_config, 'top_k'):
+                    model.generation_config.top_k = None
+                if hasattr(model.generation_config, 'do_sample'):
+                    model.generation_config.do_sample = False
+            except Exception as e2:
+                print(f"[WARNING] Could not clear generation_config attributes: {e2}")
     
     # Get EOS token IDs (for Qwen2.5 and other models)
     curr_eos = [tokenizer.eos_token_id]
@@ -307,10 +337,11 @@ def evaluate_model(
                 
                 # Generate with stopping criteria
                 print(f"[Generating (max_new_tokens={max_new_tokens})... This may take 10-60 seconds...]")
+                cuda_status = check_cuda_status()
+                print(f"[CUDA Status: {cuda_status}]")
                 print(f"[GPU Memory Check: {torch.cuda.memory_allocated()/1024**3:.2f}GB allocated, {torch.cuda.memory_reserved()/1024**3:.2f}GB reserved]")
                 sys.stdout.flush()  # Force flush output
                 
-                import time
                 start_time = time.time()
                 
                 try:
@@ -335,13 +366,40 @@ def evaluate_model(
                         gen_kwargs['temperature'] = max(0.01, min(temperature, 2.0))  # Clamp temperature
                     else:
                         gen_kwargs['do_sample'] = False
-                        # Explicitly set these to None to override any default generation_config
-                        gen_kwargs['temperature'] = None
-                        gen_kwargs['top_p'] = None
-                        gen_kwargs['top_k'] = None
+                        # For greedy decoding, explicitly unset sampling parameters
+                        # This ensures they don't interfere with do_sample=False
+                        if 'temperature' in gen_kwargs:
+                            del gen_kwargs['temperature']
+                        if 'top_p' in gen_kwargs:
+                            del gen_kwargs['top_p']
+                        if 'top_k' in gen_kwargs:
+                            del gen_kwargs['top_k']
                     
-                    with torch.no_grad():
-                        outputs = model.generate(**gen_kwargs)
+                    # Debug: print generation config
+                    print(f"[DEBUG] Generation kwargs: do_sample={gen_kwargs.get('do_sample', 'N/A')}, "
+                          f"temperature={gen_kwargs.get('temperature', 'N/A')}, "
+                          f"max_new_tokens={gen_kwargs.get('max_new_tokens', 'N/A')}")
+                    sys.stdout.flush()
+                    
+                    # Direct generation call with better error handling
+                    # Note: If this hangs, it's likely a CUDA operation issue
+                    # Run `python scripts/check_cuda.py` in another terminal to diagnose
+                    print(f"[DEBUG] Starting model.generate() call...")
+                    print(f"[DEBUG] If this hangs, run 'python scripts/check_cuda.py' in another terminal to diagnose CUDA")
+                    sys.stdout.flush()
+                    
+                    try:
+                        with torch.no_grad():
+                            outputs = model.generate(**gen_kwargs)
+                        print(f"[DEBUG] model.generate() returned successfully")
+                        sys.stdout.flush()
+                    except Exception as gen_error:
+                        elapsed = time.time() - start_time
+                        print(f"[ERROR] Generation failed after {elapsed:.1f}s: {gen_error}")
+                        print(f"[DEBUG] CUDA Status: {check_cuda_status()}")
+                        import traceback
+                        traceback.print_exc()
+                        raise
                     
                     elapsed = time.time() - start_time
                     print(f"[Generation completed in {elapsed:.1f}s. Output length: {outputs.shape[1]} tokens]")
