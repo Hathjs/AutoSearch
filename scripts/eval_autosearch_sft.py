@@ -50,16 +50,50 @@ class StopOnSequence(StoppingCriteria):
     """Stop generation when encountering specific sequences like </search>, </recall>, </answer>"""
     def __init__(self, target_sequences: List[str], tokenizer):
         self.target_ids = [tokenizer.encode(seq, add_special_tokens=False) for seq in target_sequences]
+        # Filter out empty sequences
+        self.target_ids = [tid for tid in self.target_ids if len(tid) > 0]
         self.target_lengths = [len(target_id) for target_id in self.target_ids]
         self._tokenizer = tokenizer
+        
+        if len(self.target_lengths) == 0:
+            raise ValueError("No valid target sequences provided")
 
     def __call__(self, input_ids, scores, **kwargs):
-        targets = [torch.as_tensor(target_id, device=input_ids.device) for target_id in self.target_ids]
-        if input_ids.shape[1] < min(self.target_lengths):
+        # Safety checks
+        try:
+            if input_ids.shape[1] == 0:
+                return False
+            
+            if len(self.target_lengths) == 0:
+                return False
+            
+            min_length = min(self.target_lengths)
+            if input_ids.shape[1] < min_length:
+                return False
+            
+            # Use CPU for comparison to avoid GPU numerical issues
+            # Only check the last few tokens to avoid memory issues
+            # Check up to the maximum target length + some buffer
+            max_check_length = max(self.target_lengths) + 10
+            check_length = min(max_check_length, input_ids.shape[1])
+            input_ids_cpu = input_ids[0, -check_length:].cpu()
+            
+            for i, target_id in enumerate(self.target_ids):
+                if len(target_id) == 0:
+                    continue
+                if input_ids_cpu.shape[0] < len(target_id):
+                    continue
+                
+                # Compare using CPU tensors with proper dtype
+                target_tensor = torch.tensor(target_id, dtype=input_ids.dtype)
+                # Compare the last len(target_tensor) tokens
+                if torch.equal(input_ids_cpu[-len(target_tensor):], target_tensor):
+                    return True
+        except Exception as e:
+            # If comparison fails, don't stop (fail-safe)
+            # Don't print here to avoid flooding output during generation
             return False
-        for i, target in enumerate(targets):
-            if torch.equal(input_ids[0, -self.target_lengths[i]:], target):
-                return True
+        
         return False
 
 
@@ -193,10 +227,13 @@ def evaluate_model(
         curr_eos.append(tokenizer.im_end_id)
     
     # Stopping criteria for detecting action tags
-    target_sequences = ["</search>", " </search>", "</search>\n", " </search>\n", "</search>\n\n", " </search>\n\n",
-                       "</recall>", " </recall>", "</recall>\n", " </recall>\n", "</recall>\n\n", " </recall>\n\n",
-                       "</answer>", " </answer>", "</answer>\n", " </answer>\n", "</answer>\n\n", " </answer>\n\n"]
-    stopping_criteria = StoppingCriteriaList([StopOnSequence(target_sequences, tokenizer)])
+    # Use simpler sequences to avoid tokenization issues
+    target_sequences = ["</search>", "</recall>", "</answer>"]
+    try:
+        stopping_criteria = StoppingCriteriaList([StopOnSequence(target_sequences, tokenizer)])
+    except Exception as e:
+        print(f"[WARNING] Failed to create stopping criteria: {e}. Continuing without it.")
+        stopping_criteria = None
     
     results = []
     
@@ -263,22 +300,46 @@ def evaluate_model(
                 start_time = time.time()
                 
                 try:
+                    # Prepare generation kwargs
+                    gen_kwargs = {
+                        'input_ids': input_ids,
+                        'attention_mask': attention_mask,
+                        'max_new_tokens': max_new_tokens,
+                        'pad_token_id': tokenizer.pad_token_id,
+                        'eos_token_id': tokenizer.eos_token_id,
+                    }
+                    
+                    # Add stopping criteria if available
+                    if stopping_criteria is not None:
+                        gen_kwargs['stopping_criteria'] = stopping_criteria
+                    
+                    # Handle sampling parameters safely
+                    if temperature > 0:
+                        gen_kwargs['do_sample'] = True
+                        gen_kwargs['temperature'] = max(0.01, min(temperature, 2.0))  # Clamp temperature
+                    else:
+                        gen_kwargs['do_sample'] = False
+                    
                     with torch.no_grad():
-                        outputs = model.generate(
-                            input_ids,
-                            attention_mask=attention_mask,
-                            max_new_tokens=max_new_tokens,
-                            stopping_criteria=stopping_criteria,
-                            pad_token_id=tokenizer.pad_token_id,
-                            eos_token_id=tokenizer.eos_token_id,
-                            do_sample=temperature > 0,
-                            temperature=temperature if temperature > 0 else None,
-                        )
+                        outputs = model.generate(**gen_kwargs)
+                    
                     elapsed = time.time() - start_time
                     print(f"[Generation completed in {elapsed:.1f}s. Output length: {outputs.shape[1]} tokens]")
                 except KeyboardInterrupt:
                     print("\n[Generation interrupted by user]")
                     raise
+                except RuntimeError as e:
+                    error_str = str(e)
+                    if "CUDA" in error_str or "cuda" in error_str or "out of memory" in error_str.lower():
+                        print(f"[CUDA ERROR during generation: {error_str}]")
+                        print("[Trying to clear CUDA cache...]")
+                        torch.cuda.empty_cache()
+                        break
+                    else:
+                        print(f"[RuntimeError during generation: {error_str}]")
+                        import traceback
+                        traceback.print_exc()
+                        break
                 except Exception as e:
                     print(f"[ERROR during generation: {e}]")
                     import traceback
