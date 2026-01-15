@@ -9,7 +9,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import sys
 import time
 
-def test_model_simple(model_path: str, question: str = "1+1等于几？", max_new_tokens: int = 100):
+def test_model_simple(model_path: str, question: str = "1+1等于几？", max_new_tokens: int = 100, force_cpu: bool = False):
     """Test model with a simple question"""
     
     print("=" * 60)
@@ -33,26 +33,49 @@ def test_model_simple(model_path: str, question: str = "1+1等于几？", max_ne
     
     # Load model
     print("\n[2/4] Loading model...")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if force_cpu:
+        device = "cpu"
+        print("  Forced CPU mode")
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
     try:
+        # Try to load with specific dtype and disable flash attention to avoid issues
+        # Flash Attention requires float16/bfloat16, but may cause hangs if not properly configured
+        print("  Attempting to load with float16 and disabled flash attention...")
+        
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             trust_remote_code=True,
             torch_dtype=torch.float16 if device == "cuda" else torch.float32,
             device_map="auto" if device == "cuda" else None,
+            attn_implementation="eager",  # Disable Flash Attention, use eager implementation
         )
         if device == "cpu":
             model = model.to(device)
         model.eval()
-        print(f"✓ Model loaded on {device}")
+        print(f"✓ Model loaded on {device} with dtype={model.dtype}")
         
         # Check GPU memory
         if device == "cuda":
             allocated = torch.cuda.memory_allocated() / 1024**3
             reserved = torch.cuda.memory_reserved() / 1024**3
             print(f"  GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+            
+            # Test a simple forward pass before generation
+            print("\n  Testing a simple forward pass...")
+            test_input = torch.randint(0, 1000, (1, 5)).to(device)
+            try:
+                with torch.no_grad():
+                    _ = model(test_input)
+                torch.cuda.synchronize()
+                print("  ✓ Forward pass successful")
+            except Exception as e:
+                print(f"  ✗ Forward pass failed: {e}")
+                import traceback
+                traceback.print_exc()
+                return
     except Exception as e:
         print(f"✗ Failed to load model: {e}")
         import traceback
@@ -137,10 +160,93 @@ def test_model_simple(model_path: str, question: str = "1+1等于几？", max_ne
         
         # Generate
         print("\nCalling model.generate()...")
+        print(f"  Input shape: {input_ids.shape}")
+        print(f"  Model dtype: {model.dtype}")
+        print(f"  Input dtype: {input_ids.dtype}")
         sys.stdout.flush()
         
-        with torch.no_grad():
-            outputs = model.generate(**gen_kwargs)
+        # Ensure input and model are on same device and dtype
+        if device == "cuda":
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            # Sync before generation
+            torch.cuda.synchronize()
+            print("  ✓ CUDA synchronized before generation")
+            sys.stdout.flush()
+        
+        # Add timeout mechanism using threading
+        import threading
+        generation_result = [None]
+        generation_error = [None]
+        generation_done = threading.Event()
+        
+        def run_generation():
+            try:
+                with torch.no_grad():
+                    result = model.generate(**gen_kwargs)
+                generation_result[0] = result
+                generation_done.set()
+            except Exception as e:
+                generation_error[0] = e
+                generation_done.set()
+        
+        # Start generation in a separate thread
+        gen_thread = threading.Thread(target=run_generation, daemon=False)
+        gen_thread.start()
+        
+        # Wait with timeout
+        print("  Waiting for generation (max 120s)...")
+        sys.stdout.flush()
+        
+        timeout = 120  # 2 minutes
+        check_interval = 2  # Check every 2 seconds
+        
+        for i in range(timeout // check_interval):
+            if generation_done.wait(timeout=check_interval):
+                break
+            elapsed = (i + 1) * check_interval
+            print(f"  Still generating... {elapsed}s elapsed")
+            sys.stdout.flush()
+            
+            # Check CUDA status
+            if device == "cuda":
+                try:
+                    torch.cuda.synchronize()
+                except Exception as e:
+                    print(f"  ⚠ CUDA sync check failed: {e}")
+        
+        # Check if thread is still alive
+        if gen_thread.is_alive():
+            elapsed = time.time() - start_time
+            print(f"\n  ✗ Generation timeout after {elapsed:.1f}s!")
+            print(f"  Thread still alive: {gen_thread.is_alive()}")
+            print(f"  This suggests model.generate() is stuck or blocked")
+            
+            # Try to get some info about what's happening
+            if device == "cuda":
+                try:
+                    allocated = torch.cuda.memory_allocated() / 1024**3
+                    print(f"  GPU Memory: {allocated:.2f}GB")
+                    torch.cuda.synchronize()
+                    print(f"  CUDA sync: OK")
+                except Exception as e:
+                    print(f"  CUDA sync failed: {e}")
+            
+            print("\n  Possible causes:")
+            print("    1. Flash Attention issue (try disabling)")
+            print("    2. CUDA driver/kernel issue")
+            print("    3. Model architecture incompatibility")
+            print("    4. Memory corruption")
+            return
+        
+        # Check for errors
+        if generation_error[0] is not None:
+            raise generation_error[0]
+        
+        if generation_result[0] is None:
+            raise RuntimeError("Generation did not complete")
+        
+        outputs = generation_result[0]
         
         elapsed = time.time() - start_time
         print(f"\n✓ Generation completed in {elapsed:.1f}s")
@@ -200,11 +306,14 @@ if __name__ == "__main__":
                         help="Test question (default: '1+1等于几？')")
     parser.add_argument("--max_new_tokens", type=int, default=100,
                         help="Maximum number of new tokens to generate (default: 100)")
+    parser.add_argument("--cpu", action="store_true",
+                        help="Force CPU mode (slower but useful for debugging)")
     
     args = parser.parse_args()
     
     test_model_simple(
         model_path=args.model_path,
         question=args.question,
-        max_new_tokens=args.max_new_tokens
+        max_new_tokens=args.max_new_tokens,
+        force_cpu=args.cpu
     )
