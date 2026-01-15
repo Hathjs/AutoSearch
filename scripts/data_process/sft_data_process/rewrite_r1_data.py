@@ -161,7 +161,12 @@ def get_system_prompt(data_source: str) -> str:
     else:
         return SYSTEM_PROMPT_BASE
 
-def make_user_prompt(question: str, golden_answer: str, data_source: str = 'nq') -> str:
+def make_user_prompt(
+    question: str,
+    golden_answer: str,
+    data_source: str = 'nq',
+    desired_action: Optional[str] = None,
+) -> str:
     """Generate user prompt for GPT-4"""
     base_prompt = f"""Input Data:
 Question: "{question}"
@@ -171,6 +176,13 @@ Golden Answer: "{golden_answer}"
 1. You MUST include <answer>{golden_answer}</answer> in your output
 2. Follow tag pairing rules: <recall> -> <memory>, <search> -> <information>
 3. Do NOT mix: <recall> with <information> or <search> with <memory>
+"""
+
+    if desired_action in ("recall", "search"):
+        base_prompt += f"""
+**ACTION OVERRIDE (MANDATORY):**
+- You MUST choose <{desired_action}> as the FIRST action.
+- Still follow tag pairing rules and include <answer>{golden_answer}</answer>.
 """
     
     if data_source == 'hotpotqa':
@@ -345,6 +357,58 @@ def safe_json_loads(raw_text: str) -> tuple[Optional[Dict], Optional[str]]:
 
     return None, "No JSON object found"
 
+def is_nq_easy_recall_candidate(question: str) -> bool:
+    """
+    Heuristic: identify NQ questions that are likely common knowledge / definitional,
+    so forcing <recall> won't create too much policy mismatch.
+    """
+    q = question.strip().lower()
+    # Short definitional / concept questions
+    easy_prefixes = (
+        "what is ",
+        "what are ",
+        "define ",
+        "meaning of ",
+        "definition of ",
+        "capital of ",
+        "where is ",
+        "where are ",
+    )
+    if q.startswith(easy_prefixes):
+        return True
+
+    # Avoid forcing recall on clearly lookup-heavy patterns
+    hard_markers = (
+        "who played",
+        "voice of",
+        "episodes",
+        "season",
+        "released",
+        "release date",
+        "born",
+        "birth",
+        "produced",
+        "producer",
+        "directed",
+        "director",
+        "cast",
+        "box office",
+        "population",
+        "how many",
+        "when did",
+        "when was",
+        "in 19",
+        "in 20",
+    )
+    if any(m in q for m in hard_markers):
+        return False
+
+    # Very short questions are often common-ish
+    if len(q) <= 40 and q.endswith("?"):
+        return True
+
+    return False
+
 def rewrite_single_sample(
     key_manager: APIKeyManager,
     question: str,
@@ -352,11 +416,12 @@ def rewrite_single_sample(
     data_source: str = 'nq',
     model: str = "gpt-4",
     answer_match_mode: str = "strict",
+    desired_action: Optional[str] = None,
 ) -> Optional[Dict]:
     """Rewrite a single (question, golden_answer) pair into AutoSearch format"""
     
     system_prompt = get_system_prompt(data_source)
-    user_prompt = make_user_prompt(question, golden_answer, data_source)
+    user_prompt = make_user_prompt(question, golden_answer, data_source, desired_action=desired_action)
     
     for attempt in range(3):  # Retry up to 3 times
         try:
@@ -394,7 +459,8 @@ def rewrite_single_sample(
                     'original_question': question,
                     'golden_answer': golden_answer,
                     'data_source': data_source,
-                    'model': model
+                    'model': model,
+                    'desired_action': desired_action,
                 }
                 return result
             else:
@@ -465,6 +531,12 @@ def main():
         choices=["strict", "substring"],
         help="Answer matching mode for validation. strict aligns with EM (default). substring is more lenient."
     )
+    parser.add_argument(
+        "--nq_target_recall_ratio",
+        type=float,
+        default=0.2,
+        help="Target recall ratio for NQ samples only (default: 0.2). Uses heuristics + forcing to reach the ratio."
+    )
     
     args = parser.parse_args()
     
@@ -492,6 +564,25 @@ def main():
     # Shuffle samples
     random.shuffle(samples)
     
+    # Decide desired_action for NQ samples to increase recall ratio
+    nq_indices = [i for i, s in enumerate(samples) if s.get('data_source') == 'nq']
+    easy_nq_indices = [i for i in nq_indices if is_nq_easy_recall_candidate(samples[i]['question'])]
+    target_nq_recall = int(round(len(nq_indices) * float(args.nq_target_recall_ratio))) if nq_indices else 0
+    target_nq_recall = max(0, min(target_nq_recall, len(easy_nq_indices)))
+    forced_recall_set = set(random.sample(easy_nq_indices, k=target_nq_recall)) if target_nq_recall > 0 else set()
+
+    for i, s in enumerate(samples):
+        if s.get('data_source') == 'nq':
+            s['desired_action'] = 'recall' if i in forced_recall_set else None
+        else:
+            s['desired_action'] = None
+
+    if nq_indices:
+        print(f"\nNQ action routing:")
+        print(f"  NQ total: {len(nq_indices)}")
+        print(f"  NQ easy candidates: {len(easy_nq_indices)}")
+        print(f"  NQ forced recall: {len(forced_recall_set)} (target_ratio={args.nq_target_recall_ratio})")
+
     # Show data source distribution
     data_source_counts = {}
     for sample in samples:
@@ -519,6 +610,7 @@ def main():
             sample.get('data_source', 'nq'),
             args.model,
             answer_match_mode=args.answer_match_mode,
+            desired_action=sample.get('desired_action'),
         )
     
     def save_results(results_list, output_path, is_final=False):
