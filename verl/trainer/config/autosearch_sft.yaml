@@ -1,7 +1,9 @@
 # AutoSearch SFT Training Configuration
 data:
   train_batch_size: 64
-  micro_batch_size: 32  # gradient accumulation steps = train_batch_size / micro_batch_size (must be divisible by dp_size=8)
+  micro_batch_size: 64  # gradient accumulation steps = train_batch_size / micro_batch_size (must be divisible by dp_size=8)
+  # 注意：micro_batch_size 不能太小，否则每个GPU的micro_batch太小（<8）可能导致FSDP数值不稳定
+  # 建议：micro_batch_size >= train_batch_size，这样每个GPU不需要分割batch，避免数值精度问题
   train_files: /mnt/dolphinfs/ssd_pool/docker/user/hadoop-ai-search/chenqing30/cqproject/autosearch/data/autosearch_sft_processed/train.parquet
   val_files: /mnt/dolphinfs/ssd_pool/docker/user/hadoop-ai-search/chenqing30/cqproject/autosearch/data/autosearch_sft_processed/val.parquet
   prompt_key: question  # column name in parquet for prompt
@@ -46,7 +48,7 @@ trainer:
   validate_before_training: False
   # 临时开关：是否跳过 validation（用于排查 SIGFPE 问题）
   # 如果设为 true，训练会跳过所有 validation，直接完成所有 epoch
-  skip_validation: true  # 暂时跳过 validation 以验证训练本身是否正常
+  skip_validation: false  # 现在训练能跑了，可以恢复 validation 测试
   # 临时开关：validation 阶段是否做跨 rank all_reduce 规约
   # 用于排查 "Starting validation..." 后立刻 SIGFPE 的问题
   # 如果关闭后训练能跑通，则基本可确认是 all_reduce / NCCL / 规约触发的底层异常
