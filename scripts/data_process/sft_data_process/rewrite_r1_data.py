@@ -39,23 +39,40 @@ Your task is to generate a training trace following the AutoSearch XML protocol.
 
 **DECISION LOGIC (Critical):**
 - **Use <recall>** if the question asks for:
-  * Common knowledge (e.g., "Who wrote Hamlet?", "Capital of France")
-  * Well-known facts that a model should know from pre-training
-  * Simple definitions or basic concepts
+  * Well-known facts that most people know (e.g., "Capital of France" → Paris)
+  * Common knowledge from pre-training (e.g., "Who wrote Hamlet?" → Shakespeare)
+  * Basic definitions (e.g., "What is photosynthesis?" → process by which plants...)
+  * Simple historical facts (e.g., "When did World War II end?" → 1945)
+  * **Rule**: If you would know this without looking it up, use <recall>
   
 - **Use <search>** if the question asks for:
-  * Specific entity details (e.g., "Who produced the 2005 film X?")
-  * Obscure facts or dates
-  * Information that requires looking up specific Wikipedia pages
-  * Multi-hop reasoning (e.g., "What is the population of the capital of X?")
+  * Specific dates, numbers, or statistics (e.g., "Population of X in 1990")
+  * Obscure facts or recent events (e.g., "Who produced the 2005 film X?")
+  * Information requiring Wikipedia lookup (e.g., "Who played character Y in movie Z?")
+  * Specific entity details not in common knowledge
+  * **Rule**: If you need to look up specific information, use <search>
 
 **CRITICAL CONSTRAINTS:**
-1. The <information> content MUST be realistic Wikipedia-style snippets (as of 2018)
-2. The information MUST contain evidence that directly supports the golden answer
-3. Do NOT include future events or information beyond 2018
-4. The reasoning chain must be logically sound: question -> action -> feedback -> answer
-5. The final <answer> MUST exactly match the provided golden answer
-6. Keep the answer SHORT - just the entity or exact phrase, no sentences
+1. **TAG PAIRING RULES (MUST FOLLOW):**
+   - If you use <recall>, you MUST use <memory> for feedback (NOT <information>)
+   - If you use <search>, you MUST use <information> for feedback (NOT <memory>)
+   - DO NOT mix: <recall> with <information> or <search> with <memory>
+
+2. **ANSWER TAG (MANDATORY):**
+   - You MUST include an <answer> tag with the exact golden answer
+   - Format: <answer>Golden Answer</answer>
+   - The answer MUST be SHORT - just the entity or exact phrase, no sentences
+   - Example: <answer>Paris</answer> NOT <answer>The capital is Paris.</answer>
+
+3. **Content Quality:**
+   - The <information> content MUST be realistic Wikipedia-style snippets (as of 2018)
+   - The <memory> content MUST be concise facts that the model should know
+   - The information MUST contain evidence that directly supports the golden answer
+   - Do NOT include future events or information beyond 2018
+
+4. **Reasoning Chain:**
+   - The reasoning chain must be logically sound: question -> action -> feedback -> answer
+   - The final <answer> MUST exactly match the provided golden answer
 
 Output MUST be a single valid JSON object:
 {
@@ -64,6 +81,14 @@ Output MUST be a single valid JSON object:
     {"role": "assistant", "content": "..."}
   ]
 }
+
+**REMINDER: Your output MUST include <answer>Golden Answer</answer> tag!**
+
+**FEW-SHOT (FORMAT ONLY; DO NOT COPY FACTS VERBATIM):**
+- Single-hop + recall:
+{"messages":[{"role":"user","content":"EXAMPLE_Q1"},{"role":"assistant","content":"<think>Common knowledge → recall.</think>\n<recall>EXAMPLE_QUERY</recall>\n<memory>EXAMPLE_EVIDENCE_CONTAINING_ANSWER</memory>\n<answer>EXAMPLE_ANSWER</answer>"}]}
+- Single-hop + search:
+{"messages":[{"role":"user","content":"EXAMPLE_Q2"},{"role":"assistant","content":"<think>Specific detail → search.</think>\n<search>EXAMPLE_QUERY</search>\n<information>EXAMPLE_WIKI_SNIPPET_CONTAINING_ANSWER</information>\n<answer>EXAMPLE_ANSWER</answer>"}]}
 """
 
 # Additional prompt for multi-hop questions (HotpotQA)
@@ -94,12 +119,26 @@ Your task is to generate a training trace following the AutoSearch XML protocol.
 - For multi-hop questions, you may need MULTIPLE search/recall steps
 
 **CRITICAL CONSTRAINTS:**
-1. The <information> content MUST be realistic Wikipedia-style snippets (as of 2018)
-2. Each information snippet should support one step of the reasoning chain
-3. Do NOT include future events or information beyond 2018
-4. The reasoning chain must be logically sound and show the multi-hop progression
-5. The final <answer> MUST exactly match the provided golden answer
-6. Keep the answer SHORT - just the entity or exact phrase, no sentences
+1. **TAG PAIRING RULES (MUST FOLLOW):**
+   - If you use <recall>, you MUST use <memory> for feedback (NOT <information>)
+   - If you use <search>, you MUST use <information> for feedback (NOT <memory>)
+   - DO NOT mix: <recall> with <information> or <search> with <memory>
+   - Each step must follow this rule consistently
+
+2. **ANSWER TAG (MANDATORY):**
+   - You MUST include an <answer> tag with the exact golden answer
+   - Format: <answer>Golden Answer</answer>
+   - The answer MUST be SHORT - just the entity or exact phrase, no sentences
+
+3. **Content Quality:**
+   - The <information> content MUST be realistic Wikipedia-style snippets (as of 2018)
+   - The <memory> content MUST be concise facts that the model should know
+   - Each information snippet should support one step of the reasoning chain
+   - Do NOT include future events or information beyond 2018
+
+4. **Reasoning Chain:**
+   - The reasoning chain must be logically sound and show the multi-hop progression
+   - The final <answer> MUST exactly match the provided golden answer
 
 Output MUST be a single valid JSON object:
 {
@@ -108,6 +147,11 @@ Output MUST be a single valid JSON object:
     {"role": "assistant", "content": "..."}
   ]
 }
+
+**REMINDER: Your output MUST include <answer>Golden Answer</answer> tag!**
+
+**FEW-SHOT (MULTI-HOP SHAPE; DO NOT COPY FACTS VERBATIM):**
+{"messages":[{"role":"user","content":"EXAMPLE_MULTI_HOP_Q"},{"role":"assistant","content":"<think>Need intermediate fact then final fact.</think>\n<search>EXAMPLE_QUERY_STEP1</search>\n<information>EXAMPLE_SNIPPET_STEP1_CONTAINING_INTERMEDIATE</information>\n<think>Use intermediate to find final answer.</think>\n<search>EXAMPLE_QUERY_STEP2</search>\n<information>EXAMPLE_SNIPPET_STEP2_CONTAINING_FINAL_ANSWER</information>\n<answer>EXAMPLE_ANSWER</answer>"}]}
 """
 
 def get_system_prompt(data_source: str) -> str:
@@ -122,10 +166,15 @@ def make_user_prompt(question: str, golden_answer: str, data_source: str = 'nq')
     base_prompt = f"""Input Data:
 Question: "{question}"
 Golden Answer: "{golden_answer}"
+
+**CRITICAL REQUIREMENTS:**
+1. You MUST include <answer>{golden_answer}</answer> in your output
+2. Follow tag pairing rules: <recall> -> <memory>, <search> -> <information>
+3. Do NOT mix: <recall> with <information> or <search> with <memory>
 """
     
     if data_source == 'hotpotqa':
-        base_prompt += """
+        base_prompt += f"""
 Task:
 1. This is a MULTI-HOP question - analyze what intermediate information is needed.
 2. Generate the complete trace with multiple reasoning steps if needed.
@@ -133,15 +182,19 @@ Task:
 4. Ensure the final <answer> matches exactly: "{golden_answer}"
 5. The simulated <information> or <memory> MUST contain evidence supporting each step.
 6. Remember: This is 2018 Wikipedia knowledge, not current events.
+7. **MANDATORY**: Include <answer>{golden_answer}</answer> at the end.
 """
     else:
         base_prompt += f"""
 Task:
 1. Analyze the question difficulty (common knowledge vs specific detail).
+   - If it's common knowledge (e.g., "Capital of France"), use <recall> -> <memory>
+   - If it requires specific lookup (e.g., "Who produced film X in 2005?"), use <search> -> <information>
 2. Generate the complete trace following AutoSearch protocol.
 3. Ensure the final <answer> matches exactly: "{golden_answer}"
 4. The simulated <information> or <memory> MUST contain evidence supporting the answer.
 5. Remember: This is 2018 Wikipedia knowledge, not current events.
+6. **MANDATORY**: Include <answer>{golden_answer}</answer> at the end.
 """
     
     return base_prompt
@@ -182,35 +235,50 @@ def validate_rewritten_sample(sample: Dict, original_question: str, golden_answe
         
         # 2. Check reasoning exists (try multiple formats)
         # Note: SYSTEM_PROMPT uses `<think>` but model might generate various formats
-        has_reasoning = False
-        reasoning_patterns = [
-            r'<think>',  # Standard format from SYSTEM_PROMPT
-            r'<think>',               # Alternative format
-            r'`<think>`',             # With backticks
-            r'<think>',               # Another variant
-            r'`<think>`'              # With backticks variant
-        ]
-        for pattern in reasoning_patterns:
-            if re.search(pattern, content, re.IGNORECASE):
-                has_reasoning = True
-                break
-        
-        if not has_reasoning:
+        if not re.search(r'<think>', content, re.IGNORECASE) and not re.search(r'`<think>`', content, re.IGNORECASE):
             return False, "Missing reasoning tag (expected <think> or <think>)"
         
         # 3. Check action and feedback consistency
-        has_recall = '<recall>' in content and '<memory>' in content
-        has_search = '<search>' in content and '<information>' in content
+        has_recall = '<recall>' in content
+        has_search = '<search>' in content
+        has_memory = '<memory>' in content
+        has_information = '<information>' in content
         
         if not (has_recall or has_search):
-            return False, "Missing action tags (<recall>+<memory> or <search>+<information>)"
+            return False, "Missing action tags (<recall> or <search>)"
         
-        # Allow both recall and search (multi-turn is valid)
-        # Just check that they have corresponding feedback
-        if '<recall>' in content and '<memory>' not in content:
-            return False, "Has <recall> but missing <memory>"
-        if '<search>' in content and '<information>' not in content:
-            return False, "Has <search> but missing <information>"
+        # Check tag pairing rules
+        if has_recall and not has_memory:
+            return False, "Has <recall> but missing <memory> (must pair recall with memory)"
+        if has_search and not has_information:
+            return False, "Has <search> but missing <information> (must pair search with information)"
+        
+        # Check for incorrect pairings
+        if has_recall and has_information:
+            # Check if information is used with recall (incorrect pairing)
+            recall_positions = [m.start() for m in re.finditer(r'<recall>', content)]
+            information_positions = [m.start() for m in re.finditer(r'<information>', content)]
+            # If information appears after a recall, it's a pairing error
+            for recall_pos in recall_positions:
+                for info_pos in information_positions:
+                    if info_pos > recall_pos:
+                        # Check if there's a search between them
+                        search_between = re.search(r'<search>', content[recall_pos:info_pos])
+                        if not search_between:
+                            return False, "Incorrect pairing: <recall> should use <memory>, not <information>"
+        
+        if has_search and has_memory:
+            # Check if memory is used with search (incorrect pairing)
+            search_positions = [m.start() for m in re.finditer(r'<search>', content)]
+            memory_positions = [m.start() for m in re.finditer(r'<memory>', content)]
+            # If memory appears after a search, it's a pairing error
+            for search_pos in search_positions:
+                for mem_pos in memory_positions:
+                    if mem_pos > search_pos:
+                        # Check if there's a recall between them
+                        recall_between = re.search(r'<recall>', content[search_pos:mem_pos])
+                        if not recall_between:
+                            return False, "Incorrect pairing: <search> should use <information>, not <memory>"
         
         # 4. Check answer length (warning but not fail)
         if len(extracted_answer) > 100:
