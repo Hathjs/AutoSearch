@@ -207,7 +207,13 @@ def em_match(answer1: str, answer2: str) -> bool:
     """Simple exact match check (case-insensitive, stripped)"""
     return answer1.strip().lower() == answer2.strip().lower()
 
-def validate_rewritten_sample(sample: Dict, original_question: str, golden_answer: str, verbose: bool = False) -> tuple[bool, str]:
+def validate_rewritten_sample(
+    sample: Dict,
+    original_question: str,
+    golden_answer: str,
+    answer_match_mode: str = "strict",
+    verbose: bool = False
+) -> tuple[bool, str]:
     """
     Validate the quality of rewritten sample.
     
@@ -227,11 +233,18 @@ def validate_rewritten_sample(sample: Dict, original_question: str, golden_answe
         
         extracted_answer = answer_match.group(1).strip()
         
-        # Check answer match (allow some flexibility)
-        if not em_match(extracted_answer, golden_answer):
-            # Allow substring match for multi-word answers
-            if golden_answer.lower() not in extracted_answer.lower() and extracted_answer.lower() not in golden_answer.lower():
-                return False, f"Answer mismatch: expected '{golden_answer}', got '{extracted_answer}'"
+        # Check answer match
+        # NOTE: For EM evaluation alignment, default is strict (exact match after strip, case-insensitive).
+        # Use --answer_match_mode substring only for debugging / higher yield.
+        if answer_match_mode == "strict":
+            if not em_match(extracted_answer, golden_answer):
+                return False, f"Answer mismatch(strict): expected '{golden_answer}', got '{extracted_answer}'"
+        elif answer_match_mode == "substring":
+            if not em_match(extracted_answer, golden_answer):
+                if golden_answer.lower() not in extracted_answer.lower() and extracted_answer.lower() not in golden_answer.lower():
+                    return False, f"Answer mismatch(substring): expected '{golden_answer}', got '{extracted_answer}'"
+        else:
+            return False, f"Unknown answer_match_mode: {answer_match_mode}"
         
         # 2. Check reasoning exists (try multiple formats)
         # Note: SYSTEM_PROMPT uses `<think>` but model might generate various formats
@@ -294,12 +307,51 @@ def validate_rewritten_sample(sample: Dict, original_question: str, golden_answe
 # Rewrite Functions
 # ==============================================================================
 
+def safe_json_loads(raw_text: str) -> tuple[Optional[Dict], Optional[str]]:
+    """
+    Robust JSON loader for cases where the model returns extra text around a JSON object.
+    Returns (obj, error_message).
+    """
+    # Fast path
+    try:
+        return json.loads(raw_text), None
+    except Exception:
+        pass
+
+    # Strip markdown fences
+    text = raw_text.strip()
+    if "```json" in text:
+        text = text.split("```json", 1)[1]
+        text = text.split("```", 1)[0].strip()
+    elif "```" in text:
+        text = text.split("```", 1)[1]
+        text = text.split("```", 1)[0].strip()
+
+    # Try parse again
+    try:
+        return json.loads(text), None
+    except Exception:
+        pass
+
+    # Fallback: extract first {...} block
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = text[start:end + 1]
+        try:
+            return json.loads(candidate), None
+        except Exception as e:
+            return None, f"Failed to parse extracted JSON candidate: {e}"
+
+    return None, "No JSON object found"
+
 def rewrite_single_sample(
     key_manager: APIKeyManager,
     question: str,
     golden_answer: str,
     data_source: str = 'nq',
-    model: str = "gpt-4"
+    model: str = "gpt-4",
+    answer_match_mode: str = "strict",
 ) -> Optional[Dict]:
     """Rewrite a single (question, golden_answer) pair into AutoSearch format"""
     
@@ -322,22 +374,19 @@ def rewrite_single_sample(
             
             raw_content = response.choices[0].message.content
             
-            # Clean up markdown code blocks if present
-            if "```json" in raw_content:
-                clean_content = raw_content.split("```json")[1].split("```")[0].strip()
-            elif "```" in raw_content:
-                clean_content = raw_content.split("```")[1].split("```")[0].strip()
-            else:
-                clean_content = raw_content
-            
-            try:
-                result = json.loads(clean_content)
-            except json.JSONDecodeError as e:
-                print(f"[JSON Error] Attempt {attempt+1}: {e}")
+            result, json_err = safe_json_loads(raw_content)
+            if result is None:
+                print(f"[JSON Error] Attempt {attempt+1}: {json_err}")
                 print(f"[JSON Error] Raw content (first 200 chars): {raw_content[:200]}...")
                 continue
             
-            is_valid, error_msg = validate_rewritten_sample(result, question, golden_answer, verbose=(attempt == 2))
+            is_valid, error_msg = validate_rewritten_sample(
+                result,
+                question,
+                golden_answer,
+                answer_match_mode=answer_match_mode,
+                verbose=(attempt == 2),
+            )
             if is_valid:
                 # Add metadata
                 result['meta'] = {
@@ -409,6 +458,13 @@ def main():
                         help="LLM model to use (gpt-4, gpt-4o, etc.)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
+    parser.add_argument(
+        "--answer_match_mode",
+        type=str,
+        default="strict",
+        choices=["strict", "substring"],
+        help="Answer matching mode for validation. strict aligns with EM (default). substring is more lenient."
+    )
     
     args = parser.parse_args()
     
@@ -461,7 +517,8 @@ def main():
             sample['question'],
             sample['golden_answer'],
             sample.get('data_source', 'nq'),
-            args.model
+            args.model,
+            answer_match_mode=args.answer_match_mode,
         )
     
     def save_results(results_list, output_path, is_final=False):
