@@ -44,8 +44,11 @@ trainer:
   total_epochs: 3
   total_training_steps: null
   validate_before_training: False
+  # 临时开关：是否跳过 validation（用于排查 SIGFPE 问题）
+  # 如果设为 true，训练会跳过所有 validation，直接完成所有 epoch
+  skip_validation: true  # 暂时跳过 validation 以验证训练本身是否正常
   # 临时开关：validation 阶段是否做跨 rank all_reduce 规约
-  # 用于排查 “Starting validation...” 后立刻 SIGFPE 的问题
+  # 用于排查 "Starting validation..." 后立刻 SIGFPE 的问题
   # 如果关闭后训练能跑通，则基本可确认是 all_reduce / NCCL / 规约触发的底层异常
   val_all_reduce: false
   logger: ['console']  # Change to ['console', 'wandb'] if wandb is configured
