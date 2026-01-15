@@ -221,6 +221,20 @@ def evaluate_model(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
+    # Clear default generation config to avoid conflicts with our explicit parameters
+    if hasattr(model, 'generation_config'):
+        # Reset sampling parameters to None so they don't interfere
+        # Use setattr to ensure the values are actually set
+        try:
+            model.generation_config.temperature = None
+            model.generation_config.top_p = None
+            model.generation_config.top_k = None
+            # Also try to set do_sample to None if possible
+            if hasattr(model.generation_config, 'do_sample'):
+                model.generation_config.do_sample = None
+        except Exception as e:
+            print(f"[WARNING] Could not clear generation_config: {e}")
+    
     # Get EOS token IDs (for Qwen2.5 and other models)
     curr_eos = [tokenizer.eos_token_id]
     if hasattr(tokenizer, 'im_end_id') and tokenizer.im_end_id is not None:
@@ -310,8 +324,10 @@ def evaluate_model(
                     }
                     
                     # Add stopping criteria if available
-                    if stopping_criteria is not None:
-                        gen_kwargs['stopping_criteria'] = stopping_criteria
+                    # Temporarily disable to debug hanging issues
+                    # TODO: Re-enable after fixing stopping_criteria
+                    # if stopping_criteria is not None:
+                    #     gen_kwargs['stopping_criteria'] = stopping_criteria
                     
                     # Handle sampling parameters safely
                     if temperature > 0:
@@ -319,6 +335,10 @@ def evaluate_model(
                         gen_kwargs['temperature'] = max(0.01, min(temperature, 2.0))  # Clamp temperature
                     else:
                         gen_kwargs['do_sample'] = False
+                        # Explicitly set these to None to override any default generation_config
+                        gen_kwargs['temperature'] = None
+                        gen_kwargs['top_p'] = None
+                        gen_kwargs['top_k'] = None
                     
                     with torch.no_grad():
                         outputs = model.generate(**gen_kwargs)
