@@ -184,79 +184,63 @@ def test_model_simple(model_path: str, question: str = "1+1等于几？", max_ne
             print("  ✓ CUDA synchronized before generation")
             sys.stdout.flush()
         
-        # Add timeout mechanism using threading
-        import threading
-        generation_result = [None]
-        generation_error = [None]
-        generation_done = threading.Event()
-        
-        def run_generation():
-            try:
-                with torch.no_grad():
-                    result = model.generate(**gen_kwargs)
-                generation_result[0] = result
-                generation_done.set()
-            except Exception as e:
-                generation_error[0] = e
-                generation_done.set()
-        
-        # Start generation in a separate thread
-        gen_thread = threading.Thread(target=run_generation, daemon=False)
-        gen_thread.start()
-        
-        # Wait with timeout
-        print("  Waiting for generation (max 120s)...")
+        # Try a very simple generation first (without fancy features)
+        print("  Attempting simple generation with minimal config...")
         sys.stdout.flush()
         
-        timeout = 120  # 2 minutes
-        check_interval = 2  # Check every 2 seconds
+        # Disable KV cache and other optimizations that might cause issues
+        simple_gen_kwargs = {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'max_new_tokens': max_new_tokens,
+            'do_sample': False,
+            'pad_token_id': tokenizer.pad_token_id,
+            'eos_token_id': tokenizer.eos_token_id,
+            'use_cache': False,  # Disable KV cache to avoid potential issues
+        }
         
-        for i in range(timeout // check_interval):
-            if generation_done.wait(timeout=check_interval):
-                break
-            elapsed = (i + 1) * check_interval
-            print(f"  Still generating... {elapsed}s elapsed")
+        print(f"  Generation config: max_new_tokens={simple_gen_kwargs['max_new_tokens']}, "
+              f"do_sample={simple_gen_kwargs['do_sample']}, use_cache={simple_gen_kwargs['use_cache']}")
+        sys.stdout.flush()
+        
+        # Test with a very short generation first
+        print("  Testing with max_new_tokens=1 first...")
+        test_gen_kwargs = simple_gen_kwargs.copy()
+        test_gen_kwargs['max_new_tokens'] = 1
+        
+        try:
+            print("  [TEST] Calling model.generate() with max_new_tokens=1...")
             sys.stdout.flush()
-            
-            # Check CUDA status
-            if device == "cuda":
-                try:
-                    torch.cuda.synchronize()
-                except Exception as e:
-                    print(f"  ⚠ CUDA sync check failed: {e}")
-        
-        # Check if thread is still alive
-        if gen_thread.is_alive():
-            elapsed = time.time() - start_time
-            print(f"\n  ✗ Generation timeout after {elapsed:.1f}s!")
-            print(f"  Thread still alive: {gen_thread.is_alive()}")
-            print(f"  This suggests model.generate() is stuck or blocked")
-            
-            # Try to get some info about what's happening
-            if device == "cuda":
-                try:
-                    allocated = torch.cuda.memory_allocated() / 1024**3
-                    print(f"  GPU Memory: {allocated:.2f}GB")
-                    torch.cuda.synchronize()
-                    print(f"  CUDA sync: OK")
-                except Exception as e:
-                    print(f"  CUDA sync failed: {e}")
-            
-            print("\n  Possible causes:")
-            print("    1. Flash Attention issue (try disabling)")
-            print("    2. CUDA driver/kernel issue")
-            print("    3. Model architecture incompatibility")
-            print("    4. Memory corruption")
+            with torch.no_grad():
+                test_output = model.generate(**test_gen_kwargs)
+            print(f"  ✓ Test generation (1 token) succeeded! Shape: {test_output.shape}")
+            sys.stdout.flush()
+        except Exception as e:
+            print(f"  ✗ Test generation (1 token) FAILED: {e}")
+            import traceback
+            traceback.print_exc()
+            print("\n  This suggests the issue is in the generation process itself.")
+            print("  Possible causes:")
+            print("    1. CUDA kernel issue")
+            print("    2. Model weight format issue")
+            print("    3. PyTorch/CUDA version incompatibility")
             return
         
-        # Check for errors
-        if generation_error[0] is not None:
-            raise generation_error[0]
+        # If test passed, try full generation
+        print(f"\n  [MAIN] Calling model.generate() with max_new_tokens={max_new_tokens}...")
+        sys.stdout.flush()
         
-        if generation_result[0] is None:
-            raise RuntimeError("Generation did not complete")
-        
-        outputs = generation_result[0]
+        try:
+            with torch.no_grad():
+                outputs = model.generate(**simple_gen_kwargs)
+            print(f"  ✓ Full generation succeeded!")
+            sys.stdout.flush()
+        except Exception as e:
+            elapsed = time.time() - start_time
+            print(f"\n  ✗ Generation failed after {elapsed:.1f}s: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
         
         elapsed = time.time() - start_time
         print(f"\n✓ Generation completed in {elapsed:.1f}s")
