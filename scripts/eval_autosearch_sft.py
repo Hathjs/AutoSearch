@@ -2,14 +2,19 @@
 """
 Simple evaluation script for AutoSearch V2 SFT model.
 Tests the model's ability to generate correct XML tags and answers.
+Supports multi-turn interaction with search and recall actions.
 """
 
 import torch
 import transformers
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, StoppingCriteria, StoppingCriteriaList
 import re
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 import json
+import requests
+import signal
+import sys
+import threading
 
 def make_prefix(question: str) -> str:
     """Generate system prompt for AutoSearch V2."""
@@ -39,6 +44,63 @@ Please answer the user's question step-by-step.
 Question: {question}
 """
     return prefix
+
+
+class StopOnSequence(StoppingCriteria):
+    """Stop generation when encountering specific sequences like </search>, </recall>, </answer>"""
+    def __init__(self, target_sequences: List[str], tokenizer):
+        self.target_ids = [tokenizer.encode(seq, add_special_tokens=False) for seq in target_sequences]
+        self.target_lengths = [len(target_id) for target_id in self.target_ids]
+        self._tokenizer = tokenizer
+
+    def __call__(self, input_ids, scores, **kwargs):
+        targets = [torch.as_tensor(target_id, device=input_ids.device) for target_id in self.target_ids]
+        if input_ids.shape[1] < min(self.target_lengths):
+            return False
+        for i, target in enumerate(targets):
+            if torch.equal(input_ids[0, -self.target_lengths[i]:], target):
+                return True
+        return False
+
+
+def search_query(query: str, search_url: str = "http://127.0.0.1:8000/retrieve", topk: int = 3) -> str:
+    """
+    Call the retrieval server to search for a query.
+    
+    Args:
+        query: Search query string
+        search_url: URL of the retrieval server
+        topk: Number of documents to retrieve
+        
+    Returns:
+        Formatted search results string
+    """
+    try:
+        payload = {
+            "queries": [query],
+            "topk": topk,
+            "return_scores": True
+        }
+        response = requests.post(search_url, json=payload, timeout=10)
+        response.raise_for_status()
+        results = response.json()['result']
+        
+        def _passages2string(retrieval_result):
+            format_reference = ''
+            for idx, doc_item in enumerate(retrieval_result):
+                content = doc_item['document']['contents']
+                title = content.split("\n")[0]
+                text = "\n".join(content.split("\n")[1:])
+                format_reference += f"Doc {idx+1}(Title: {title}) {text}\n"
+            return format_reference
+        
+        return _passages2string(results[0])
+    except requests.exceptions.RequestException as e:
+        print(f"[WARNING] Search API call failed: {e}")
+        return "Search service unavailable. Please check if retrieval server is running."
+    except Exception as e:
+        print(f"[WARNING] Error processing search results: {e}")
+        return "Error processing search results."
 
 
 def parse_response(text: str) -> Dict[str, any]:
@@ -94,9 +156,24 @@ def evaluate_model(
     test_questions: List[str],
     max_new_tokens: int = 1024,
     temperature: float = 0.7,
-    device: str = "cuda"
+    device: str = "cuda",
+    search_url: Optional[str] = "http://127.0.0.1:8000/retrieve",
+    max_turns: int = 10,
+    enable_search: bool = True
 ):
-    """Evaluate the SFT model on test questions."""
+    """
+    Evaluate the SFT model on test questions with multi-turn interaction.
+    
+    Args:
+        model_path: Path to the fine-tuned model
+        test_questions: List of test questions
+        max_new_tokens: Maximum new tokens per turn
+        temperature: Sampling temperature
+        device: Device to use (cuda/cpu)
+        search_url: URL of the retrieval server (None to disable search)
+        max_turns: Maximum number of interaction turns
+        enable_search: Whether to enable search API calls
+    """
     
     print(f"Loading model from {model_path}...")
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -110,6 +187,17 @@ def evaluate_model(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
+    # Get EOS token IDs (for Qwen2.5 and other models)
+    curr_eos = [tokenizer.eos_token_id]
+    if hasattr(tokenizer, 'im_end_id') and tokenizer.im_end_id is not None:
+        curr_eos.append(tokenizer.im_end_id)
+    
+    # Stopping criteria for detecting action tags
+    target_sequences = ["</search>", " </search>", "</search>\n", " </search>\n", "</search>\n\n", " </search>\n\n",
+                       "</recall>", " </recall>", "</recall>\n", " </recall>\n", "</recall>\n\n", " </recall>\n\n",
+                       "</answer>", " </answer>", "</answer>\n", " </answer>\n", "</answer>\n\n", " </answer>\n\n"]
+    stopping_criteria = StoppingCriteriaList([StopOnSequence(target_sequences, tokenizer)])
+    
     results = []
     
     for i, question in enumerate(test_questions):
@@ -117,46 +205,159 @@ def evaluate_model(
         print(f"Test {i+1}/{len(test_questions)}: {question}")
         print(f"{'='*80}")
         
-        # Generate prompt
-        prompt = make_prefix(question)
+        # Generate initial prompt
+        initial_prompt = make_prefix(question)
         
         # Apply chat template if available
         if tokenizer.chat_template:
-            messages = [{"role": "user", "content": prompt}]
+            messages = [{"role": "user", "content": initial_prompt}]
             prompt = tokenizer.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
                 tokenize=False
             )
+        else:
+            prompt = initial_prompt
         
-        # Tokenize
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        # Multi-turn interaction loop
+        full_response = ""
+        turn = 0
         
-        # Generate
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                do_sample=temperature > 0,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id
-            )
+        # Flag for graceful shutdown
+        stop_generation = threading.Event()
         
-        # Decode
-        generated_text = tokenizer.decode(
-            outputs[0][inputs['input_ids'].shape[1]:],
-            skip_special_tokens=False
-        )
+        def signal_handler(sig, frame):
+            """Handle Ctrl+C gracefully"""
+            print("\n\n[Received interrupt signal (Ctrl+C). Stopping generation...]")
+            stop_generation.set()
+            sys.exit(0)
         
-        # Parse response
-        parsed = parse_response(generated_text)
+        # Register signal handler
+        signal.signal(signal.SIGINT, signal_handler)
+        
+        print(f"\n[Starting multi-turn interaction (max {max_turns} turns)]")
+        print(f"[Press Ctrl+C to stop gracefully]")
+        
+        try:
+            while turn < max_turns:
+                turn += 1
+                print(f"\n--- Turn {turn} ---")
+            
+                # Check if stop was requested
+                if stop_generation.is_set():
+                    print("\n[Stop requested, breaking loop]")
+                    break
+                
+                # Tokenize current prompt
+                print(f"[Tokenizing prompt... (length: {len(prompt)} chars)]")
+                input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
+                attention_mask = torch.ones_like(input_ids)
+                print(f"[Tokenized to {input_ids.shape[1]} tokens]")
+                
+                # Generate with stopping criteria
+                print(f"[Generating (max_new_tokens={max_new_tokens})... This may take 10-60 seconds...]")
+                sys.stdout.flush()  # Force flush output
+                
+                try:
+                    with torch.no_grad():
+                        outputs = model.generate(
+                            input_ids,
+                            attention_mask=attention_mask,
+                            max_new_tokens=max_new_tokens,
+                            stopping_criteria=stopping_criteria,
+                            pad_token_id=tokenizer.pad_token_id,
+                            eos_token_id=tokenizer.eos_token_id,
+                            do_sample=temperature > 0,
+                            temperature=temperature if temperature > 0 else None,
+                        )
+                    print(f"[Generation completed. Output length: {outputs.shape[1]} tokens]")
+                except KeyboardInterrupt:
+                    print("\n[Generation interrupted by user]")
+                    raise
+                except Exception as e:
+                    print(f"[ERROR during generation: {e}]")
+                    import traceback
+                    traceback.print_exc()
+                    break
+                
+                # Check if generation ended with EOS
+                if outputs[0][-1].item() in curr_eos:
+                    generated_tokens = outputs[0][input_ids.shape[1]:]
+                    output_text = tokenizer.decode(generated_tokens, skip_special_tokens=False)
+                    full_response += output_text
+                    print(f"Generated: {output_text[:200]}...")
+                    print("[EOS reached, ending interaction]")
+                    break
+                
+                # Decode new tokens
+                generated_tokens = outputs[0][input_ids.shape[1]:]
+                output_text = tokenizer.decode(generated_tokens, skip_special_tokens=False)
+                full_response += output_text
+                
+                print(f"Generated: {output_text[:200]}...")
+                
+                # Check what action was taken
+                full_text_so_far = tokenizer.decode(outputs[0], skip_special_tokens=False)
+                
+                search_match = re.search(r'<search>(.*?)</search>', full_text_so_far, re.DOTALL)
+                recall_match = re.search(r'<recall>(.*?)</recall>', full_text_so_far, re.DOTALL)
+                answer_match = re.search(r'<answer>(.*?)</answer>', full_text_so_far, re.DOTALL)
+                
+                # Handle actions
+                if answer_match:
+                    # Final answer found
+                    print("[Final answer detected, ending interaction]")
+                    break
+                elif search_match:
+                    # Model requested search
+                    search_query_text = search_match.group(1).strip()
+                    print(f"[Model requested search: '{search_query_text}']")
+                    
+                    if enable_search and search_url:
+                        try:
+                            search_results = search_query(search_query_text, search_url)
+                            print(f"[Search results retrieved]")
+                            # Append search feedback to prompt
+                            prompt += output_text + f"\n\n<information>{search_results}</information>\n\n"
+                        except Exception as e:
+                            print(f"[WARNING] Search failed: {e}")
+                            prompt += output_text + "\n\n<information>Search service unavailable.</information>\n\n"
+                    else:
+                        print("[Search disabled in evaluation mode]")
+                        prompt += output_text + "\n\n<information>Search disabled in evaluation mode.</information>\n\n"
+                elif recall_match:
+                    # Model requested recall (internal memory)
+                    recall_query_text = recall_match.group(1).strip()
+                    print(f"[Model requested recall: '{recall_query_text}']")
+                    # Append memory feedback (model should generate this from training)
+                    prompt += output_text + "\n\n<memory>Retrieving internal knowledge...</memory>\n\n"
+                else:
+                    # No action tag found, continue generation
+                    if turn >= max_turns:
+                        print(f"[Max turns ({max_turns}) reached, stopping]")
+                        break
+                    # Continue to next turn
+                    prompt += output_text
+        
+        except KeyboardInterrupt:
+            print("\n\n[Interrupted by user. Saving partial results...]")
+        except Exception as e:
+            print(f"\n\n[ERROR: {e}]")
+            import traceback
+            traceback.print_exc()
+        
+        # Parse final response
+        parsed = parse_response(full_response)
         parsed['question'] = question
+        parsed['num_turns'] = turn
         
         # Print results
-        print(f"\nGenerated Response:")
-        print(f"{generated_text[:500]}..." if len(generated_text) > 500 else generated_text)
-        print(f"\nParsed Results:")
+        print(f"\n{'='*80}")
+        print("Generated Response:")
+        print(f"{full_response[:1000]}..." if len(full_response) > 1000 else full_response)
+        print(f"\n{'='*80}")
+        print("Parsed Results:")
+        print(f"  - Num Turns: {parsed['num_turns']}")
         print(f"  - Has Reasoning: {parsed['has_reasoning']}")
         print(f"  - Has Recall: {parsed['has_recall']} (queries: {parsed['recall_queries']})")
         print(f"  - Has Memory: {parsed['has_memory']}")
@@ -208,14 +409,31 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_new_tokens",
         type=int,
-        default=1024,
-        help="Maximum number of new tokens to generate"
+        default=512,
+        help="Maximum number of new tokens to generate per turn (default: 512, reduce if generation is slow)"
     )
     parser.add_argument(
         "--temperature",
         type=float,
         default=0.7,
         help="Sampling temperature"
+    )
+    parser.add_argument(
+        "--search_url",
+        type=str,
+        default="http://127.0.0.1:8000/retrieve",
+        help="URL of the retrieval server (set to empty string to disable search)"
+    )
+    parser.add_argument(
+        "--max_turns",
+        type=int,
+        default=10,
+        help="Maximum number of interaction turns"
+    )
+    parser.add_argument(
+        "--disable_search",
+        action="store_true",
+        help="Disable search API calls (for testing without retrieval server)"
     )
     
     args = parser.parse_args()
@@ -251,12 +469,31 @@ if __name__ == "__main__":
         ]
         print("No test questions provided, using default questions...")
     
+    # Check if search URL is provided
+    search_url = args.search_url if args.search_url else None
+    enable_search = not args.disable_search and search_url is not None
+    
+    if enable_search:
+        print(f"\n[INFO] Search enabled. Retrieval server URL: {search_url}")
+        # Test connection
+        try:
+            test_response = requests.get(search_url.replace("/retrieve", "/health") if "/retrieve" in search_url else search_url, timeout=2)
+            print(f"[INFO] Retrieval server connection OK")
+        except:
+            print(f"[WARNING] Cannot connect to retrieval server. Search calls may fail.")
+            print(f"[INFO] You can start the retrieval server with: bash retrieval_launch.sh")
+    else:
+        print(f"\n[INFO] Search disabled. Model will receive placeholder responses for <search> actions.")
+    
     # Evaluate
     results = evaluate_model(
         model_path=args.model_path,
         test_questions=test_questions,
         max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature
+        temperature=args.temperature,
+        search_url=search_url,
+        max_turns=args.max_turns,
+        enable_search=enable_search
     )
     
     # Save results
