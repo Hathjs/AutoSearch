@@ -12,14 +12,14 @@ import random
 import re
 import argparse
 import concurrent.futures
+import threading
 import httpx
 from tqdm import tqdm
 from openai import OpenAI
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 # Import APIKeyManager from generate_sft_data.py
 import sys
-# Add parent directory to path to import from generate_sft_data.py
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from generate_sft_data import APIKeyManager
 
@@ -27,7 +27,7 @@ from generate_sft_data import APIKeyManager
 # Prompt Templates
 # ==============================================================================
 
-SYSTEM_PROMPT = """You are an expert annotator for Search Agents.
+SYSTEM_PROMPT_BASE = """You are an expert annotator for Search Agents.
 You will be given a (Question, Golden Answer) pair from a 2018 Wikipedia-based dataset.
 Your task is to generate a training trace following the AutoSearch XML protocol.
 
@@ -66,12 +66,76 @@ Output MUST be a single valid JSON object:
 }
 """
 
-def make_user_prompt(question: str, golden_answer: str) -> str:
+# Additional prompt for multi-hop questions (HotpotQA)
+SYSTEM_PROMPT_MULTIHOP = """You are an expert annotator for Search Agents.
+You will be given a (Question, Golden Answer) pair from a 2018 Wikipedia-based dataset.
+This is a MULTI-HOP question that requires reasoning across multiple facts or entities.
+
+Your task is to generate a training trace following the AutoSearch XML protocol.
+
+**Protocol:**
+1. `<think>`...reasoning...`</think>`
+2. Action: <recall>query</recall> OR <search>query</search>
+3. Feedback: <memory>...content...</memory> OR <information>...content...</information>
+4. [If needed] Additional reasoning and search/recall steps for multi-hop reasoning
+5. <answer>Golden Answer</answer> (MUST match exactly)
+
+**MULTI-HOP REASONING LOGIC:**
+- Multi-hop questions require connecting multiple pieces of information
+- You may need to:
+  1. First search/recall for intermediate information (e.g., "What is the capital of X?")
+  2. Then use that information to search/recall for the final answer (e.g., "What is the population of [capital]?")
+- Each step should have its own `<think>`, action, and feedback
+- The final answer should be derived from the combined information
+
+**DECISION LOGIC:**
+- **Use <recall>** for common knowledge that the model should know
+- **Use <search>** for specific facts, dates, or obscure information
+- For multi-hop questions, you may need MULTIPLE search/recall steps
+
+**CRITICAL CONSTRAINTS:**
+1. The <information> content MUST be realistic Wikipedia-style snippets (as of 2018)
+2. Each information snippet should support one step of the reasoning chain
+3. Do NOT include future events or information beyond 2018
+4. The reasoning chain must be logically sound and show the multi-hop progression
+5. The final <answer> MUST exactly match the provided golden answer
+6. Keep the answer SHORT - just the entity or exact phrase, no sentences
+
+Output MUST be a single valid JSON object:
+{
+  "messages": [
+    {"role": "user", "content": "..."},
+    {"role": "assistant", "content": "..."}
+  ]
+}
+"""
+
+def get_system_prompt(data_source: str) -> str:
+    """Get appropriate system prompt based on data source"""
+    if data_source == 'hotpotqa':
+        return SYSTEM_PROMPT_MULTIHOP
+    else:
+        return SYSTEM_PROMPT_BASE
+
+def make_user_prompt(question: str, golden_answer: str, data_source: str = 'nq') -> str:
     """Generate user prompt for GPT-4"""
-    return f"""Input Data:
+    base_prompt = f"""Input Data:
 Question: "{question}"
 Golden Answer: "{golden_answer}"
-
+"""
+    
+    if data_source == 'hotpotqa':
+        base_prompt += """
+Task:
+1. This is a MULTI-HOP question - analyze what intermediate information is needed.
+2. Generate the complete trace with multiple reasoning steps if needed.
+3. Each step should have: <think> -> action -> feedback
+4. Ensure the final <answer> matches exactly: "{golden_answer}"
+5. The simulated <information> or <memory> MUST contain evidence supporting each step.
+6. Remember: This is 2018 Wikipedia knowledge, not current events.
+"""
+    else:
+        base_prompt += f"""
 Task:
 1. Analyze the question difficulty (common knowledge vs specific detail).
 2. Generate the complete trace following AutoSearch protocol.
@@ -79,6 +143,8 @@ Task:
 4. The simulated <information> or <memory> MUST contain evidence supporting the answer.
 5. Remember: This is 2018 Wikipedia knowledge, not current events.
 """
+    
+    return base_prompt
 
 # ==============================================================================
 # Validation Functions
@@ -88,18 +154,23 @@ def em_match(answer1: str, answer2: str) -> bool:
     """Simple exact match check (case-insensitive, stripped)"""
     return answer1.strip().lower() == answer2.strip().lower()
 
-def validate_rewritten_sample(sample: Dict, original_question: str, golden_answer: str) -> bool:
-    """Validate the quality of rewritten sample"""
+def validate_rewritten_sample(sample: Dict, original_question: str, golden_answer: str, verbose: bool = False) -> tuple[bool, str]:
+    """
+    Validate the quality of rewritten sample.
+    
+    Returns:
+        (is_valid, error_message)
+    """
     try:
         if 'messages' not in sample or len(sample['messages']) < 2:
-            return False
+            return False, "Missing messages field or insufficient messages"
         
         content = sample['messages'][1]['content']
         
         # 1. Check answer exists and matches
         answer_match = re.search(r'<answer>(.*?)</answer>', content, re.DOTALL)
         if not answer_match:
-            return False
+            return False, "Missing <answer> tag"
         
         extracted_answer = answer_match.group(1).strip()
         
@@ -107,37 +178,49 @@ def validate_rewritten_sample(sample: Dict, original_question: str, golden_answe
         if not em_match(extracted_answer, golden_answer):
             # Allow substring match for multi-word answers
             if golden_answer.lower() not in extracted_answer.lower() and extracted_answer.lower() not in golden_answer.lower():
-                return False
+                return False, f"Answer mismatch: expected '{golden_answer}', got '{extracted_answer}'"
         
-        # 2. Check reasoning exists
-        if '`<think>`' not in content:
-            return False
+        # 2. Check reasoning exists (try multiple formats)
+        # Note: SYSTEM_PROMPT uses `<think>` but model might generate various formats
+        has_reasoning = False
+        reasoning_patterns = [
+            r'<think>',  # Standard format from SYSTEM_PROMPT
+            r'<think>',               # Alternative format
+            r'`<think>`',             # With backticks
+            r'<think>',               # Another variant
+            r'`<think>`'              # With backticks variant
+        ]
+        for pattern in reasoning_patterns:
+            if re.search(pattern, content, re.IGNORECASE):
+                has_reasoning = True
+                break
+        
+        if not has_reasoning:
+            return False, "Missing reasoning tag (expected <think> or <think>)"
         
         # 3. Check action and feedback consistency
         has_recall = '<recall>' in content and '<memory>' in content
         has_search = '<search>' in content and '<information>' in content
         
         if not (has_recall or has_search):
-            return False
+            return False, "Missing action tags (<recall>+<memory> or <search>+<information>)"
         
-        # Should not have both recall and search in a single trace (simplified)
-        if has_recall and has_search:
-            # Check order - recall should come before search if both exist
-            recall_pos = content.find('<recall>')
-            search_pos = content.find('<search>')
-            if recall_pos > search_pos:
-                return False
+        # Allow both recall and search (multi-turn is valid)
+        # Just check that they have corresponding feedback
+        if '<recall>' in content and '<memory>' not in content:
+            return False, "Has <recall> but missing <memory>"
+        if '<search>' in content and '<information>' not in content:
+            return False, "Has <search> but missing <information>"
         
-        # 4. Check answer length (should be short for EM)
+        # 4. Check answer length (warning but not fail)
         if len(extracted_answer) > 100:
-            # Answer might be too long for EM evaluation
-            pass  # Warning but not fail
+            if verbose:
+                print(f"[Warning] Answer is long ({len(extracted_answer)} chars): {extracted_answer[:50]}...")
         
-        return True
+        return True, ""
         
     except Exception as e:
-        print(f"[Validation Error] {e}")
-        return False
+        return False, f"Validation exception: {e}"
 
 # ==============================================================================
 # Rewrite Functions
@@ -147,11 +230,13 @@ def rewrite_single_sample(
     key_manager: APIKeyManager,
     question: str,
     golden_answer: str,
+    data_source: str = 'nq',
     model: str = "gpt-4"
 ) -> Optional[Dict]:
     """Rewrite a single (question, golden_answer) pair into AutoSearch format"""
     
-    user_prompt = make_user_prompt(question, golden_answer)
+    system_prompt = get_system_prompt(data_source)
+    user_prompt = make_user_prompt(question, golden_answer, data_source)
     
     for attempt in range(3):  # Retry up to 3 times
         try:
@@ -160,7 +245,7 @@ def rewrite_single_sample(
             response = client.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
                 response_format={"type": "json_object"},
@@ -184,17 +269,21 @@ def rewrite_single_sample(
                 print(f"[JSON Error] Raw content (first 200 chars): {raw_content[:200]}...")
                 continue
             
-            if validate_rewritten_sample(result, question, golden_answer):
+            is_valid, error_msg = validate_rewritten_sample(result, question, golden_answer, verbose=(attempt == 2))
+            if is_valid:
                 # Add metadata
                 result['meta'] = {
                     'source': 'r1_rewritten',
                     'original_question': question,
                     'golden_answer': golden_answer,
+                    'data_source': data_source,
                     'model': model
                 }
                 return result
             else:
-                print(f"[Validation Failed] Attempt {attempt+1} for question: {question[:50]}...")
+                if attempt == 2:  # Only print error on final attempt
+                    print(f"[Validation Failed] Attempt {attempt+1} for question: {question[:50]}...")
+                    print(f"  Error: {error_msg}")
                 
         except Exception as e:
             print(f"[API Error] Attempt {attempt+1}: {e}")
@@ -218,11 +307,13 @@ def load_questions_from_jsonl(jsonl_path: str, max_samples: Optional[int] = None
                     data = json.loads(line)
                     question = data.get('question', '').strip()
                     golden_answer = data.get('golden_answer', '').strip()
+                    data_source = data.get('data_source', 'nq').strip()
                     
                     if question and golden_answer:
                         samples.append({
                             'question': question,
-                            'golden_answer': golden_answer
+                            'golden_answer': golden_answer,
+                            'data_source': data_source
                         })
                         
                         if max_samples and len(samples) >= max_samples:
@@ -277,36 +368,69 @@ def main():
     # Shuffle samples
     random.shuffle(samples)
     
-    print(f"Total samples to rewrite: {len(samples)}")
+    # Show data source distribution
+    data_source_counts = {}
+    for sample in samples:
+        ds = sample.get('data_source', 'nq')
+        data_source_counts[ds] = data_source_counts.get(ds, 0) + 1
+    print(f"\nData source distribution:")
+    for ds, count in data_source_counts.items():
+        print(f"  {ds}: {count} samples")
+    
+    print(f"\nTotal samples to rewrite: {len(samples)}")
     print(f"Using {args.workers} workers")
     print(f"Model: {args.model}")
     print(f"Output: {args.output}")
     
-    # Concurrent rewriting
+    # Concurrent rewriting with periodic saving
     results = []
+    results_lock = threading.Lock()
+    save_interval = 100  # Save every 100 samples
     
     def rewrite_wrapper(sample):
         return rewrite_single_sample(
             key_manager,
             sample['question'],
             sample['golden_answer'],
+            sample.get('data_source', 'nq'),
             args.model
         )
     
+    def save_results(results_list, output_path, is_final=False):
+        """Save results to file"""
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, 'w', encoding='utf-8') as f:
+            for item in results_list:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        if not is_final:
+            print(f"\n[Progress] Saved {len(results_list)} samples to {output_path}")
+    
     print("\nStarting rewrite process...")
+    if len(samples) >= save_interval:
+        print(f"[Info] Results will be saved every {save_interval} samples and at the end")
+    else:
+        print(f"[Info] Results will be saved at the end")
+    
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = [executor.submit(rewrite_wrapper, sample) for sample in samples]
         
+        completed_count = 0
         for future in tqdm(concurrent.futures.as_completed(futures), total=len(samples), desc="Rewriting"):
-            res = future.result()
-            if res:
-                results.append(res)
+            try:
+                res = future.result()
+                if res:
+                    with results_lock:
+                        results.append(res)
+                        completed_count = len(results)
+                        
+                        # Periodic save
+                        if completed_count % save_interval == 0:
+                            save_results(results, args.output, is_final=False)
+            except Exception as e:
+                print(f"\n[Error] Exception in rewrite: {e}")
     
-    # Save results
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
-    with open(args.output, 'w', encoding='utf-8') as f:
-        for item in results:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    # Final save
+    save_results(results, args.output, is_final=True)
     
     # Print statistics
     print(f"\n{'='*60}")
@@ -330,6 +454,16 @@ def main():
         print(f"\nAction Distribution:")
         print(f"  <recall> used: {recall_count} ({recall_count/len(results)*100:.1f}%)")
         print(f"  <search> used: {search_count} ({search_count/len(results)*100:.1f}%)")
+        
+        # Show data source distribution in results
+        result_sources = {}
+        for result in results:
+            ds = result.get('meta', {}).get('data_source', 'unknown')
+            result_sources[ds] = result_sources.get(ds, 0) + 1
+        if result_sources:
+            print(f"\nResult data source distribution:")
+            for ds, count in result_sources.items():
+                print(f"  {ds}: {count} samples ({count/len(results)*100:.1f}%)")
 
 
 if __name__ == "__main__":
