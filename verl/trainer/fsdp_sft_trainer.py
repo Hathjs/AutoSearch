@@ -491,10 +491,15 @@ class FSDPSFTTrainer(object):
 
     def save_checkpoint(self, step):
         # save checkpoint
+        # 使用新的 FSDP API 避免弃用警告
         from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+        
         cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(self.fsdp_model, StateDictType.FULL_STATE_DICT, cfg):
-            state_dict = self.fsdp_model.state_dict()
+        
+        # 使用 set_state_dict_type 替代 state_dict_type context manager
+        # 注意：这会在整个模型生命周期中保持设置，但保存checkpoint后通常不需要恢复
+        FSDP.set_state_dict_type(self.fsdp_model, StateDictType.FULL_STATE_DICT, cfg)
+        state_dict = self.fsdp_model.state_dict()
 
         path = os.path.join(self.config.trainer.default_local_dir, f'global_step_{step}')
         # save huggingface model
