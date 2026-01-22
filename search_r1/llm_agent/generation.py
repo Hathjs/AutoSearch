@@ -352,7 +352,7 @@ class LLMGenerationManager:
         
         return final_output
 
-    def execute_predictions(self, predictions: List[str], pad_token: str, active_mask=None, do_search=True) -> List[str]:
+    def execute_predictions(self, predictions: List[str], pad_token: str, active_mask=None, do_search=True, do_recall=True) -> List[str]:
         """
         Execute predictions across multiple environments.
         NOTE: the function is the actual `step` function in the environment
@@ -360,7 +360,7 @@ class LLMGenerationManager:
         
         Supports three action types:
         - search: External API call, returns <information>...</information>
-        - recall: Internal memory retrieval, returns <memory>Retrieving internal knowledge...</memory>
+        - recall: Internal memory retrieval, calls recall tool to guide model recall
         - answer: Final answer, terminates the episode
         
         Args:
@@ -368,6 +368,7 @@ class LLMGenerationManager:
             pad_token: Token to use for padding
             active_mask: Mask indicating which samples are still active
             do_search: Whether to actually call search API (for validation/testing)
+            do_recall: Whether to actually call recall tool (for validation/testing)
             
         Returns:
             Tuple of (next_obs, dones, valid_action, is_search)
@@ -383,6 +384,57 @@ class LLMGenerationManager:
         else:
             search_results = [''] * sum([1 for action in cur_actions if action == 'search'])
 
+        # Batch process recall queries (only for 'recall' actions)
+        recall_queries = [content for action, content in zip(cur_actions, contents) if action == 'recall']
+        if do_recall and recall_queries and self.is_validation:
+            # In validation mode, try to use recall tool to guide model recall
+            # This helps test if the model can properly recall knowledge
+            try:
+                from search_r1.search.recall_tool import batch_recall_internal_knowledge
+                # Try to get model from actor_rollout_wg
+                model = None
+                device = "cuda"
+                
+                # Check different possible model access patterns
+                if hasattr(self.actor_rollout_wg, 'model'):
+                    model = self.actor_rollout_wg.model
+                elif hasattr(self.actor_rollout_wg, 'base_model'):
+                    model = self.actor_rollout_wg.base_model
+                elif hasattr(self.actor_rollout_wg, '_model'):
+                    model = self.actor_rollout_wg._model
+                
+                if model is not None:
+                    # Get device from model
+                    try:
+                        device = next(model.parameters()).device
+                        device = str(device) if isinstance(device, torch.device) else "cuda"
+                    except:
+                        device = "cuda"
+                    
+                    recall_results = batch_recall_internal_knowledge(
+                        queries=recall_queries,
+                        model=model,
+                        tokenizer=self.tokenizer,
+                        device=device,
+                        max_new_tokens=256,
+                        temperature=0.1
+                    )
+                else:
+                    # Model not accessible, use placeholder
+                    recall_results = [f'\n\n<memory>Retrieving internal knowledge...</memory>\n\n'] * len(recall_queries)
+            except Exception as e:
+                # If recall tool fails, use placeholder
+                # In RL training, model should generate memory based on SFT training
+                if self.is_validation:
+                    print(f"[WARNING] Recall tool not available in validation: {e}. Using placeholder.")
+                recall_results = [f'\n\n<memory>Retrieving internal knowledge...</memory>\n\n'] * len(recall_queries)
+        else:
+            # In RL training mode or when do_recall=False, use placeholder
+            # The model should generate memory content based on SFT training
+            # The placeholder acts as a trigger signal
+            recall_results = [f'\n\n<memory>Retrieving internal knowledge...</memory>\n\n'] * len(recall_queries)
+
+        recall_idx = 0
         for i, (action, active) in enumerate(zip(cur_actions, active_mask)):
             
             if not active:
@@ -404,9 +456,10 @@ class LLMGenerationManager:
                     valid_action.append(1)
                     is_search.append(1)
                 elif action == 'recall':
-                    # Internal recall: return fixed trigger signal for parametric memory
-                    # The model will generate the actual memory content based on SFT training
-                    next_obs.append(f'\n\n<memory>Retrieving internal knowledge...</memory>\n\n')
+                    # Internal recall: call recall tool to guide model recall
+                    memory_content = recall_results[recall_idx] if recall_idx < len(recall_results) else f'\n\n<memory>Retrieving internal knowledge...</memory>\n\n'
+                    next_obs.append(memory_content)
+                    recall_idx += 1
                     dones.append(0)
                     valid_action.append(1)
                     is_search.append(0)

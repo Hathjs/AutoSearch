@@ -16,6 +16,11 @@ import signal
 import sys
 import threading
 import time
+import os
+
+# Add project root to path to import recall_tool
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
+from search_r1.search.recall_tool import recall_internal_knowledge
 
 def check_cuda_status():
     """Check CUDA device status and memory usage"""
@@ -480,8 +485,27 @@ def evaluate_model(
                     # Model requested recall (internal memory)
                     recall_query_text = recall_match.group(1).strip()
                     print(f"[Model requested recall: '{recall_query_text}']")
-                    # Append memory feedback (model should generate this from training)
-                    prompt += output_text + "\n\n<memory>Retrieving internal knowledge...</memory>\n\n"
+                    
+                    # Call recall tool to guide model to recall knowledge
+                    try:
+                        print(f"[Calling recall tool...]")
+                        memory_content = recall_internal_knowledge(
+                            query=recall_query_text,
+                            model=model,
+                            tokenizer=tokenizer,
+                            device=device,
+                            max_new_tokens=256,
+                            temperature=0.1  # Low temperature for deterministic recall
+                        )
+                        print(f"[Memory recalled: {memory_content[:150]}...]")
+                        # Append recall output and memory feedback to prompt
+                        prompt += output_text + f"\n\n{memory_content}\n\n"
+                    except Exception as e:
+                        print(f"[WARNING] Recall tool failed: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        # Fallback to placeholder
+                        prompt += output_text + "\n\n<memory>No record found.</memory>\n\n"
                 else:
                     # No action tag found, continue generation
                     if turn >= max_turns:

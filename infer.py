@@ -3,6 +3,12 @@ import torch
 import random
 from datasets import load_dataset
 import requests
+import sys
+import os
+
+# Add project root to path to import recall_tool
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from search_r1.search.recall_tool import recall_internal_knowledge
 
 question = "Mike Barnett negotiated many contracts including which player that went on to become general manager of CSKA Moscow of the Kontinental Hockey League?"
 
@@ -49,9 +55,14 @@ class StopOnSequence(transformers.StoppingCriteria):
 
         return False
 
-def get_query(text):
+def get_query(text, action_type="search"):
     import re
-    pattern = re.compile(r"<search>(.*?)</search>", re.DOTALL)
+    if action_type == "search":
+        pattern = re.compile(r"<search>(.*?)</search>", re.DOTALL)
+    elif action_type == "recall":
+        pattern = re.compile(r"<recall>(.*?)</recall>", re.DOTALL)
+    else:
+        return None
     matches = pattern.findall(text)
     if matches:
         return matches[-1]
@@ -79,8 +90,10 @@ def search(query: str):
     return _passages2string(results[0])
 
 
-# Initialize the stopping criteria
-target_sequences = ["</search>", " </search>", "</search>\n", " </search>\n", "</search>\n\n", " </search>\n\n"]
+# Initialize the stopping criteria (support both search and recall)
+target_sequences = ["</search>", " </search>", "</search>\n", " </search>\n", "</search>\n\n", " </search>\n\n",
+                   "</recall>", " </recall>", "</recall>\n", " </recall>\n", "</recall>\n\n", " </recall>\n\n",
+                   "</answer>", " </answer>", "</answer>\n", " </answer>\n", "</answer>\n\n", " </answer>\n\n"]
 stopping_criteria = transformers.StoppingCriteriaList([StopOnSequence(target_sequences, tokenizer)])
 
 cnt = 0
@@ -115,14 +128,45 @@ while True:
     generated_tokens = outputs[0][input_ids.shape[1]:]
     output_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
     
-    tmp_query = get_query(tokenizer.decode(outputs[0], skip_special_tokens=True))
-    if tmp_query:
-        # print(f'searching "{tmp_query}"...')
-        search_results = search(tmp_query)
+    full_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    
+    # Check for search action
+    search_query = get_query(full_text, action_type="search")
+    recall_query = get_query(full_text, action_type="recall")
+    
+    if search_query:
+        # External search
+        print(f'[Searching: "{search_query}"]')
+        search_results = search(search_query)
+        search_text = curr_search_template.format(output_text=output_text, search_results=search_results)
+        prompt += search_text
+        cnt += 1
+        print(search_text)
+    elif recall_query:
+        # Internal recall
+        print(f'[Recalling: "{recall_query}"]')
+        try:
+            memory_content = recall_internal_knowledge(
+                query=recall_query,
+                model=model,
+                tokenizer=tokenizer,
+                device=device,
+                max_new_tokens=256,
+                temperature=0.1
+            )
+            recall_text = f'\n\n{output_text}{memory_content}\n\n'
+            prompt += recall_text
+            cnt += 1
+            print(recall_text)
+        except Exception as e:
+            print(f'[WARNING] Recall failed: {e}')
+            # Fallback
+            recall_text = f'\n\n{output_text}<memory>No record found.</memory>\n\n'
+            prompt += recall_text
+            cnt += 1
+            print(recall_text)
     else:
-        search_results = ''
-
-    search_text = curr_search_template.format(output_text=output_text, search_results=search_results)
-    prompt += search_text
-    cnt += 1
-    print(search_text)
+        # No action, just continue
+        prompt += output_text
+        cnt += 1
+        print(output_text)
