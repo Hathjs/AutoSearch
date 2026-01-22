@@ -407,9 +407,21 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
     
-    # Load tokenizer
-    print(f"Loading tokenizer from {args.model_name}...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+    # Load tokenizer (local files only, disable HuggingFace Hub)
+    model_path = os.path.abspath(os.path.expanduser(args.model_name))
+    print(f"Loading tokenizer from local path: {model_path}...")
+    
+    if not os.path.exists(model_path):
+        raise ValueError(f"Model path does not exist: {model_path}")
+    
+    if not os.path.isdir(model_path):
+        raise ValueError(f"Model path is not a directory: {model_path}")
+    
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, 
+        trust_remote_code=True,
+        local_files_only=True  # Disable HuggingFace Hub, use local files only
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
