@@ -11,7 +11,7 @@ data:
   max_length: 4096
   truncation: error
   balance_dp_token: False
-  chat_template: null
+  chat_template: true  # Use chat_template for RL training compatibility
 
 model:
   partial_pretrain: /mnt/dolphinfs/ssd_pool/docker/user/hadoop-ai-search/chongwenyue/model/Qwen2.5-3B-Instruct

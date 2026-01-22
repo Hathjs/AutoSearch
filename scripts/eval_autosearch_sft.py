@@ -301,8 +301,9 @@ def evaluate_model(
         # Generate initial prompt
         initial_prompt = make_prefix(question)
         
-        # Apply chat template if available
-        if tokenizer.chat_template:
+        # Apply chat template (consistent with training)
+        # Training uses chat_template, so evaluation should too
+        if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template:
             messages = [{"role": "user", "content": initial_prompt}]
             prompt = tokenizer.apply_chat_template(
                 messages,

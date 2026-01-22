@@ -88,8 +88,20 @@ class FSDPSFTTrainer(object):
         local_model_path = copy_local_path_from_hdfs(src=self.config.model.partial_pretrain, verbose=True)
         from verl.utils import hf_tokenizer
         self.tokenizer = hf_tokenizer(local_model_path, trust_remote_code=self.config.model.trust_remote_code)
-        if self.config.data.chat_template is not None:
-            raise ValueError('Apply Chat template from config is not supported yet.')
+        
+        # Determine if we should use chat_template
+        # If config explicitly sets chat_template, use that value
+        # Otherwise, check if tokenizer has chat_template and use it by default
+        if hasattr(self.config.data, 'chat_template') and self.config.data.chat_template is not None:
+            self.use_chat_template = self.config.data.chat_template
+        else:
+            # Default: use chat_template if tokenizer has one
+            self.use_chat_template = hasattr(self.tokenizer, 'chat_template') and self.tokenizer.chat_template is not None
+        
+        if self.device_mesh.get_rank() == 0:
+            print(f"Using chat_template: {self.use_chat_template}")
+            if self.use_chat_template:
+                print(f"Chat template available: {hasattr(self.tokenizer, 'chat_template') and self.tokenizer.chat_template is not None}")
 
         # normalize dp size
         self._normalize_config_bsz()
@@ -123,7 +135,8 @@ class FSDPSFTTrainer(object):
                                         response_key=config.data.response_key,
                                         response_dict_keys=config.data.get('response_dict_keys', None),
                                         max_length=config.data.max_length,
-                                        truncation=config.data.truncation)
+                                        truncation=config.data.truncation,
+                                        use_chat_template=self.use_chat_template)
         self.val_dataset = SFTDataset(parquet_files=config.data.val_files,
                                       tokenizer=self.tokenizer,
                                       prompt_key=config.data.prompt_key,
@@ -131,7 +144,8 @@ class FSDPSFTTrainer(object):
                                       response_key=config.data.response_key,
                                       response_dict_keys=config.data.get('response_dict_keys', None),
                                       max_length=config.data.max_length,
-                                      truncation=config.data.truncation)
+                                      truncation=config.data.truncation,
+                                      use_chat_template=self.use_chat_template)
 
         # Define collate function with access to tokenizer
         def collate_fn(batch):

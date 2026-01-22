@@ -58,7 +58,8 @@ class SFTDataset(Dataset):
                  response_dict_keys=None,
                  max_length=1024,
                  truncation='error',
-                 cache_dir='~/.cache/verl/sft'):
+                 cache_dir='~/.cache/verl/sft',
+                 use_chat_template=False):
         if not isinstance(parquet_files, (List, ListConfig)):
             parquet_files = [parquet_files]
 
@@ -72,6 +73,7 @@ class SFTDataset(Dataset):
         self.response_dict_keys = response_dict_keys
         self.max_length = max_length
         self.truncation = truncation
+        self.use_chat_template = use_chat_template
 
         self._download()
         self._read_files()
@@ -101,15 +103,25 @@ class SFTDataset(Dataset):
         # Check if we have pre-tokenized data
         self.has_tokenized = all(col in self.dataframe.columns for col in ['input_ids', 'labels', 'attention_mask'])
         
+        # Check if we have chat format (messages column)
+        self.has_chat_format = 'messages' in self.dataframe.columns
+        
         if self.has_tokenized:
             # Pre-tokenized mode: don't require prompt_key and response_key
             print("Detected pre-tokenized data (input_ids, labels, attention_mask). Using pre-tokenized mode.")
+            if self.has_chat_format and self.use_chat_template:
+                print("Detected chat format (messages column). Will use chat_template if available.")
         else:
-            # Text mode: require prompt_key and response_key
-            if self.prompt_key not in self.dataframe.columns:
-                raise ValueError(f"Column '{self.prompt_key}' not found in parquet file. Available columns: {self.dataframe.columns.tolist()}")
-            if self.response_key not in self.dataframe.columns:
-                raise ValueError(f"Column '{self.response_key}' not found in parquet file. Available columns: {self.dataframe.columns.tolist()}")
+            # Text mode: check what we have
+            if self.has_chat_format and self.use_chat_template:
+                # Chat format mode: use messages column
+                print("Using chat format mode with chat_template.")
+            else:
+                # Traditional text mode: require prompt_key and response_key
+                if self.prompt_key not in self.dataframe.columns:
+                    raise ValueError(f"Column '{self.prompt_key}' not found in parquet file. Available columns: {self.dataframe.columns.tolist()}")
+                if self.response_key not in self.dataframe.columns:
+                    raise ValueError(f"Column '{self.response_key}' not found in parquet file. Available columns: {self.dataframe.columns.tolist()}")
 
     def __len__(self):
         return len(self.dataframe)
@@ -147,56 +159,115 @@ class SFTDataset(Dataset):
             
             return result
         else:
-            # Fallback: Extract prompt and response for text-based tokenization
-            prompt = row_dict.pop(self.prompt_key)
-            response = row_dict.pop(self.response_key)
+            # Text-based tokenization: check if we have chat format
+            prompt = None
+            response = None
+            user_messages = None
+            assistant_messages = None
             
-            # Handle dict-style prompts/responses (if needed)
-            if self.prompt_dict_keys is not None:
-                if isinstance(prompt, dict):
-                    prompt = ' '.join([prompt.get(k, '') for k in self.prompt_dict_keys])
-            
-            if self.response_dict_keys is not None:
-                if isinstance(response, dict):
-                    response = ' '.join([response.get(k, '') for k in self.response_dict_keys])
-            
-            # Convert to string if needed
-            if not isinstance(prompt, str):
-                prompt = str(prompt)
-            if not isinstance(response, str):
-                response = str(response)
-            
-            # Concatenate prompt and response
-            # Format: prompt + response (with EOS token)
-            full_text = prompt + response
+            if self.has_chat_format and self.use_chat_template and hasattr(self.tokenizer, 'chat_template') and self.tokenizer.chat_template:
+                # Use chat_template format
+                messages = row_dict.pop('messages')
+                if isinstance(messages, str):
+                    import json
+                    messages = json.loads(messages)
+                
+                # Apply chat_template
+                formatted_text = self.tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=False,
+                    tokenize=False
+                )
+                
+                # Find assistant start position
+                user_messages = [msg for msg in messages if msg['role'] == 'user']
+                assistant_messages = [msg for msg in messages if msg['role'] == 'assistant']
+                
+                if user_messages and assistant_messages:
+                    # Format user part to find boundary
+                    user_formatted = self.tokenizer.apply_chat_template(
+                        user_messages,
+                        add_generation_prompt=True,
+                        tokenize=False
+                    )
+                    assistant_start_char = len(user_formatted)
+                else:
+                    assistant_start_char = 0
+                
+                full_text = formatted_text
+            else:
+                # Fallback: Extract prompt and response for text-based tokenization
+                prompt = row_dict.pop(self.prompt_key)
+                response = row_dict.pop(self.response_key)
+                
+                # Handle dict-style prompts/responses (if needed)
+                if self.prompt_dict_keys is not None:
+                    if isinstance(prompt, dict):
+                        prompt = ' '.join([prompt.get(k, '') for k in self.prompt_dict_keys])
+                
+                if self.response_dict_keys is not None:
+                    if isinstance(response, dict):
+                        response = ' '.join([response.get(k, '') for k in self.response_dict_keys])
+                
+                # Convert to string if needed
+                if not isinstance(prompt, str):
+                    prompt = str(prompt)
+                if not isinstance(response, str):
+                    response = str(response)
+                
+                # Concatenate prompt and response
+                # Format: prompt + response (with EOS token)
+                full_text = prompt + response
+                assistant_start_char = len(prompt)
             
             # Tokenize the full sequence
+            add_special_tokens = not (self.has_chat_format and self.use_chat_template)
             input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(
                 prompt=full_text,
                 tokenizer=self.tokenizer,
                 max_length=self.max_length,
                 pad_token_id=self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id,
                 left_pad=False,  # Right pad for causal LM
-                truncation=self.truncation
+                truncation=self.truncation,
+                add_special_tokens=add_special_tokens
             )
             
             # Compute position IDs
             position_ids = compute_position_id_with_mask(attention_mask)
             
             # Create loss mask: 1 for response tokens (to compute loss), 0 for prompt tokens (masked)
-            # We need to tokenize prompt separately to know where response starts
-            prompt_ids, prompt_attention_mask = verl_F.tokenize_and_postprocess_data(
-                prompt=prompt,
-                tokenizer=self.tokenizer,
-                max_length=self.max_length,
-                pad_token_id=self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id,
-                left_pad=False,
-                truncation='right'  # Allow truncation for prompt to find boundary
-            )
-            
-            # Get actual prompt length (excluding padding)
-            prompt_length = prompt_attention_mask[0].sum().item()
             seq_length = input_ids.shape[1]
+            
+            if self.has_chat_format and self.use_chat_template and hasattr(self.tokenizer, 'chat_template') and self.tokenizer.chat_template:
+                # For chat_template format, tokenize user part to find boundary
+                user_formatted = self.tokenizer.apply_chat_template(
+                    user_messages,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    return_tensors='pt',
+                    add_special_tokens=False
+                )
+                prompt_length = user_formatted['input_ids'].shape[1]
+            else:
+                # We need to tokenize prompt separately to know where response starts
+                if self.has_chat_format:
+                    # Fallback: use assistant_start_char to estimate
+                    prompt_text = full_text[:assistant_start_char]
+                else:
+                    prompt_text = prompt
+                
+                prompt_ids, prompt_attention_mask = verl_F.tokenize_and_postprocess_data(
+                    prompt=prompt_text,
+                    tokenizer=self.tokenizer,
+                    max_length=self.max_length,
+                    pad_token_id=self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id,
+                    left_pad=False,
+                    truncation='right',  # Allow truncation for prompt to find boundary
+                    add_special_tokens=add_special_tokens
+                )
+                
+                # Get actual prompt length (excluding padding)
+                prompt_length = prompt_attention_mask[0].sum().item()
             
             # Create loss mask: 1 for response tokens (to train), 0 for prompt tokens and padding
             loss_mask = torch.zeros(seq_length, dtype=torch.float32)

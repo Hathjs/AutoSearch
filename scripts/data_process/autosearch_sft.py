@@ -257,9 +257,9 @@ def debug_print_tokenization(tokenizer, input_ids, labels, full_text, assistant_
     print("="*80 + "\n")
 
 
-def process_sft_example(example, tokenizer, template_type='base', max_length=4096, debug=False):
+def process_sft_example(example, tokenizer, template_type='base', max_length=4096, debug=False, use_chat_template=True):
     """
-    Process a single SFT example from JSONL format.
+    Process a single SFT example from JSONL format with chat_template support.
     
     Args:
         example: Dict with 'messages' key containing conversation
@@ -267,9 +267,10 @@ def process_sft_example(example, tokenizer, template_type='base', max_length=409
         template_type: Template type for prompt generation
         max_length: Maximum sequence length
         debug: Whether to print debug information
+        use_chat_template: Whether to use chat_template (default: True)
     
     Returns:
-        Dict with 'input_ids', 'labels', 'attention_mask'
+        Dict with 'input_ids', 'labels', 'attention_mask', 'messages' (for chat_template)
     """
     messages = example['messages']
     
@@ -286,25 +287,61 @@ def process_sft_example(example, tokenizer, template_type='base', max_length=409
     if user_content is None or assistant_content is None:
         raise ValueError("Missing user or assistant message in example")
     
-    # Generate system prompt (includes user query)
+    # Build messages in chat format for chat_template
+    # Format: [{"role": "user", "content": system_prompt + question}, {"role": "assistant", "content": response}]
     system_prompt = make_prefix(user_content, template_type=template_type)
     
-    # Construct full text: system_prompt + assistant_response
-    full_text = system_prompt + assistant_content
-    
-    # Find where assistant response starts (for masking)
-    assistant_start_char = len(system_prompt)
-    
-    # Tokenize with offset mapping (single pass)
-    tokenized = tokenizer(
-        full_text,
-        truncation=True,
-        max_length=max_length,
-        padding=False,
-        return_tensors='pt',
-        add_special_tokens=True,
-        return_offsets_mapping=True
-    )
+    if use_chat_template and hasattr(tokenizer, 'chat_template') and tokenizer.chat_template:
+        # Use chat_template format (for RL training compatibility)
+        chat_messages = [
+            {"role": "user", "content": system_prompt},
+            {"role": "assistant", "content": assistant_content}
+        ]
+        
+        # Apply chat_template to get formatted text
+        formatted_text = tokenizer.apply_chat_template(
+            chat_messages,
+            add_generation_prompt=False,  # Don't add generation prompt, we have full conversation
+            tokenize=False
+        )
+        
+        # Tokenize with offset mapping
+        tokenized = tokenizer(
+            formatted_text,
+            truncation=True,
+            max_length=max_length,
+            padding=False,
+            return_tensors='pt',
+            add_special_tokens=False,  # chat_template already includes special tokens
+            return_offsets_mapping=True
+        )
+        
+        # Find where assistant response starts in the formatted text
+        # The formatted text should have user content, then assistant content
+        # We need to find the boundary after user content ends
+        user_formatted = tokenizer.apply_chat_template(
+            [{"role": "user", "content": system_prompt}],
+            add_generation_prompt=True,  # This adds the assistant start token
+            tokenize=False
+        )
+        assistant_start_char = len(user_formatted)
+        
+        full_text = formatted_text
+        
+    else:
+        # Fallback: No chat_template (original behavior)
+        full_text = system_prompt + assistant_content
+        assistant_start_char = len(system_prompt)
+        
+        tokenized = tokenizer(
+            full_text,
+            truncation=True,
+            max_length=max_length,
+            padding=False,
+            return_tensors='pt',
+            add_special_tokens=True,
+            return_offsets_mapping=True
+        )
     
     input_ids = tokenized['input_ids'][0].numpy()
     attention_mask = tokenized['attention_mask'][0].numpy()
@@ -325,16 +362,23 @@ def process_sft_example(example, tokenizer, template_type='base', max_length=409
             assistant_start_char, offset_mapping
         )
     
-    # Return both tokenized data (for compatibility) and original text (for SFTDataset)
-    # SFTDataset expects 'question' (prompt) and 'answer' (response) columns
-    return {
+    # Return tokenized data and chat format for SFTDataset
+    result = {
         'input_ids': input_ids.tolist(),
         'labels': labels.tolist(),
         'attention_mask': attention_mask.tolist(),
-        # Also save original text format for SFTDataset
-        'question': user_content,  # This will be used as prompt_key
-        'answer': assistant_content,  # This will be used as response_key
+        # Also save original text format for backward compatibility
+        'question': user_content,
+        'answer': assistant_content,
     }
+    
+    # Save chat format for SFTDataset (if using chat_template)
+    if use_chat_template and hasattr(tokenizer, 'chat_template') and tokenizer.chat_template:
+        # Save messages as JSON string (Parquet doesn't support nested dicts well)
+        import json
+        result['messages'] = json.dumps(chat_messages)
+    
+    return result
 
 
 if __name__ == '__main__':
@@ -356,6 +400,10 @@ if __name__ == '__main__':
                         help='Maximum sequence length for tokenization')
     parser.add_argument('--debug', action='store_true',
                         help='Enable debug output for first example')
+    parser.add_argument('--use_chat_template', action='store_true', default=True,
+                        help='Use chat_template for formatting (default: True)')
+    parser.add_argument('--no_chat_template', dest='use_chat_template', action='store_false',
+                        help='Disable chat_template (use original format)')
     
     args = parser.parse_args()
     
@@ -394,7 +442,8 @@ if __name__ == '__main__':
                 tokenizer, 
                 args.template_type,
                 max_length=args.max_length,
-                debug=debug_mode
+                debug=debug_mode,
+                use_chat_template=args.use_chat_template
             )
             processed_data.append(processed)
             if (idx + 1) % 100 == 0:
