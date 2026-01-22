@@ -38,12 +38,12 @@ optim:
   clip_grad: 1.0
 
 trainer:
-  default_local_dir: ./checkpoints/autosearch_sft_outdata
+  default_local_dir: ./checkpoints/autosearch_sft_outdata_chatemplate
   default_hdfs_dir: null  # Set to HDFS path if needed
   resume_path: null
   project_name: autosearch-sft
   experiment_name: qwen2.5-3b-v1
-  total_epochs: 3
+  total_epochs: 2
   total_training_steps: null
   validate_before_training: False
   # 临时开关：是否跳过 validation（用于排查 SIGFPE 问题）

@@ -390,7 +390,7 @@ if __name__ == '__main__':
     parser.add_argument('--output_file', type=str, default=None,
                         help='Output parquet file name (default: auto-detect from input filename)')
     parser.add_argument('--model_name', type=str, 
-                        default='/home/hadoop-ai-search/dolphinfs_ssd_hadoop-ai-search/chongwenyue/model/Qwen2.5-3B-Instruct',
+                        default='/mnt/dolphinfs/ssd_pool/docker/user/hadoop-ai-search/chongwenyue/model/Qwen2.5-3B-Instruct',
                         help='Tokenizer model name or path')
     parser.add_argument('--template_type', type=str, default='base',
                         help='Prompt template type')
