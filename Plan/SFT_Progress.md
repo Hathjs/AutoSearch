@@ -2,14 +2,16 @@
 
 ## 当前进度概览
 
-**状态**: SFT训练完成，Recall工具已实现并集成
+**状态**: Chat Template版本SFT训练进行中，Recall工具已实现并集成
 
 **时间节点**: 2025年1月
 
 **最新进展**:
-- ✅ SFT训练已完成（3个epoch，loss从1.943降到0.225）
+- 🔄 **Chat Template版本SFT训练进行中**（2个epoch，4391条训练数据）
+- ✅ 数据已重新处理，支持chat_template格式（与RL训练一致）
 - ✅ Recall工具模块已实现并集成到评估和推理流程
 - ✅ 双通道架构（recall + search）已完整实现
+- ✅ 框架已升级支持chat_template（数据处理、训练、评估全流程）
 
 ---
 
@@ -61,8 +63,9 @@
   - `train_batch_size: 64`（8卡H20，每卡8条）
   - `micro_batch_size: 64`（避免FSDP数值问题）
   - `lr: 1e-5`（标准SFT学习率）
-  - `total_epochs: 3`（约4400条训练数据，3个epoch足够）
-  - `max_length: 4096`（完全覆盖现有数据，最大token数1034）
+  - `total_epochs: 2`（4391条训练数据，2个epoch）
+  - `max_length: 4096`（完全覆盖现有数据）
+  - **`chat_template: true`** ✅ **关键更新：启用chat_template，与RL训练格式一致**
 
 #### 2.2 学习率调度
 - ✅ 使用 **Cosine Decay with Warmup**
@@ -85,25 +88,28 @@
 
 ### 4. SFT训练执行 ✅
 
-#### 4.1 训练配置
+#### 4.1 第一版训练（已完成）
 - ✅ 使用8卡H20 GPU进行分布式训练
-- ✅ Batch size: 64 (每卡8条)
-- ✅ Learning rate: 1e-5
-- ✅ Epochs: 3
-- ✅ Max length: 4096
+- ✅ 数据：959条训练样本，240条验证样本
+- ✅ 训练步数：42步（14步/epoch × 3 epochs）
+- ✅ Loss下降：Train 1.943 → 0.225, Val 0.500 → 0.327
+- ⚠️ **问题**：未使用chat_template，与RL训练格式不一致
 
-#### 4.2 训练过程
-- ✅ 数据加载：959条训练样本，240条验证样本
-- ✅ 训练步数：42步（14步/epoch × 3）
-- ✅ Loss下降趋势：
-  - Train loss: 1.943 → 0.225
-  - Val loss: 0.500 → 0.327
-- ✅ Checkpoint保存：所有epoch完成后保存一次
-
-#### 4.3 训练结果
-- ✅ 模型已收敛，loss稳定下降
-- ✅ 验证loss跟随训练loss，无过拟合迹象
-- ✅ Checkpoint已保存，可用于后续评估和RL训练
+#### 4.2 Chat Template版本训练（进行中）🔄
+- ✅ **关键改进**：启用chat_template格式，与RL训练完全一致
+- ✅ 数据重新处理：使用chat_template格式化
+- ✅ 训练配置：
+  - 数据：4391条训练样本，1098条验证样本
+  - Batch size: 64 (每卡8条)
+  - Learning rate: 1e-5
+  - Epochs: 2
+  - Max length: 4096
+  - **chat_template: true** ✅
+- 🔄 训练进度：
+  - 总步数：136步（68步/epoch × 2）
+  - 第一个epoch已完成：Train loss 1.553 → 0.471, Val loss 0.503
+  - 第二个epoch进行中
+- ✅ Checkpoint保存：所有epoch完成后保存到 `./checkpoints/autosearch_sft_outdata_chatemplate/`
 
 ### 5. Recall工具实现 ✅
 
@@ -199,21 +205,26 @@ python scripts/eval_autosearch_sft.py \
 
 ### 训练配置要点
 
-1. **Batch Size**: `train_batch_size=64`, `micro_batch_size=64`
+1. **Chat Template**: `chat_template: true` ✅
+   - **关键更新**：启用chat_template，确保SFT和RL训练格式一致
+   - 数据格式：使用对话格式 `[{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]`
+   - 训练时自动应用tokenizer的chat_template
+
+2. **Batch Size**: `train_batch_size=64`, `micro_batch_size=64`
    - 8卡H20，每卡8条，合理
    - micro_batch_size等于train_batch_size，避免FSDP数值精度问题
 
-2. **Max Length**: `4096`
-   - 数据统计：最大token数1034，平均246，99%分位522
-   - 4096完全覆盖，甚至可以考虑降低到2048节省显存
+3. **Max Length**: `4096`
+   - 完全覆盖现有数据
+   - 4096足够，可以考虑降低到2048节省显存
 
-3. **Learning Rate**: `1e-5`
+4. **Learning Rate**: `1e-5`
    - 标准SFT学习率
-   - 如果loss下降慢，可以尝试`2e-5`
+   - 当前训练loss下降正常
 
-4. **Epochs**: `3`
-   - 约4400条训练数据，3个epoch足够
-   - 总步数约207步（69步/epoch × 3）
+5. **Epochs**: `2`
+   - 4391条训练数据，2个epoch
+   - 总步数136步（68步/epoch × 2）
 
 ### Recall工具技术细节
 
@@ -312,7 +323,10 @@ python scripts/eval_autosearch_sft.py \
 
 ### 数据文件
 - `data/autosearch_sft_final.jsonl` - 最终合并数据（5489条）
-- `data/autosearch_sft_final_processed/` - Parquet格式数据（待生成）
+- `data/autosearch_sft_final_processed/` - Parquet格式数据（已生成，支持chat_template）
+  - `train.parquet`: 4391条训练数据
+  - `val.parquet`: 1098条验证数据
+  - 包含 `messages` 列（JSON字符串格式），用于chat_template格式化
 
 ---
 
@@ -329,7 +343,9 @@ python scripts/eval_autosearch_sft.py \
 **最后更新**: 2025年1月
 
 **主要更新**:
-- ✅ SFT训练已完成
+- 🔄 **Chat Template版本SFT训练进行中**（2个epoch，4391条训练数据）
+- ✅ 框架已升级支持chat_template（数据处理、训练、评估全流程）
+- ✅ 数据已重新处理，使用chat_template格式（与RL训练一致）
 - ✅ Recall工具已实现并集成
 - ✅ 双通道架构（recall + search）已完整实现
-- ✅ 评估脚本已支持recall工具调用
+- ✅ 评估脚本已支持recall工具调用和chat_template格式
