@@ -231,17 +231,34 @@ def evaluate_model(
     """
     
     print(f"Loading model from {model_path}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    # Convert to absolute path and check if it exists
+    import os
+    model_path_abs = os.path.abspath(os.path.expanduser(model_path))
+    
+    if not os.path.exists(model_path_abs):
+        raise ValueError(f"Model path does not exist: {model_path_abs}")
+    
+    if not os.path.isdir(model_path_abs):
+        raise ValueError(f"Model path is not a directory: {model_path_abs}")
+    
+    # Load tokenizer (local files only, disable HuggingFace Hub)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path_abs, 
+        trust_remote_code=True,
+        local_files_only=True  # Disable HuggingFace Hub, use local files only
+    )
     
     # Disable Flash Attention to avoid hangs (use eager implementation instead)
     # Flash Attention requires specific dtype/device configuration and may cause hangs
     print("  Loading with eager attention (Flash Attention disabled)...")
     model = AutoModelForCausalLM.from_pretrained(
-        model_path,
+        model_path_abs,
         torch_dtype=torch.float16 if device == "cuda" else torch.float32,
         device_map="auto" if device == "cuda" else None,
         trust_remote_code=True,
         attn_implementation="eager",  # CRITICAL: Disable Flash Attention to avoid hangs
+        local_files_only=True  # Disable HuggingFace Hub, use local files only
     )
     if device == "cpu":
         model = model.to(device)

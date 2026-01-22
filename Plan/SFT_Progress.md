@@ -2,12 +2,15 @@
 
 ## 当前进度概览
 
-**状态**: Chat Template版本SFT训练进行中，Recall工具已实现并集成
+**状态**: Chat Template版本SFT训练已完成，Recall工具已实现并集成
 
 **时间节点**: 2025年1月
 
 **最新进展**:
-- 🔄 **Chat Template版本SFT训练进行中**（2个epoch，4391条训练数据）
+- ✅ **Chat Template版本SFT训练已完成**（2个epoch，4391条训练数据）
+  - Train loss: 1.553 → 0.496
+  - Val loss: 0.503 → 0.493
+  - Checkpoint: `./checkpoints/autosearch_sft_outdata_chatemplate/global_step_136/`
 - ✅ 数据已重新处理，支持chat_template格式（与RL训练一致）
 - ✅ Recall工具模块已实现并集成到评估和推理流程
 - ✅ 双通道架构（recall + search）已完整实现
@@ -95,7 +98,7 @@
 - ✅ Loss下降：Train 1.943 → 0.225, Val 0.500 → 0.327
 - ⚠️ **问题**：未使用chat_template，与RL训练格式不一致
 
-#### 4.2 Chat Template版本训练（进行中）🔄
+#### 4.2 Chat Template版本训练（已完成）✅
 - ✅ **关键改进**：启用chat_template格式，与RL训练完全一致
 - ✅ 数据重新处理：使用chat_template格式化
 - ✅ 训练配置：
@@ -105,11 +108,12 @@
   - Epochs: 2
   - Max length: 4096
   - **chat_template: true** ✅
-- 🔄 训练进度：
+- ✅ 训练结果：
   - 总步数：136步（68步/epoch × 2）
-  - 第一个epoch已完成：Train loss 1.553 → 0.471, Val loss 0.503
-  - 第二个epoch进行中
-- ✅ Checkpoint保存：所有epoch完成后保存到 `./checkpoints/autosearch_sft_outdata_chatemplate/`
+  - **Epoch 1**: Train loss 1.553 → 0.471, Val loss 0.503
+  - **Epoch 2**: Train loss 0.515 → 0.496, Val loss 0.493
+  - **最终loss**: Train 0.496, Val 0.493（验证loss略低于训练loss，表现良好）
+- ✅ Checkpoint已保存：`./checkpoints/autosearch_sft_outdata_chatemplate/global_step_136/`
 
 ### 5. Recall工具实现 ✅
 
@@ -149,18 +153,27 @@
 
 ### 4. 模型验证
 
-#### 4.1 基础功能测试
+#### 4.1 基础功能测试（Chat Template版本）
 ```bash
-# 启用recall工具（默认）
+# 使用chat_template版本的checkpoint
+MODEL_PATH="./checkpoints/autosearch_sft_outdata_chatemplate/global_step_136"
+
+# 基础测试（启用recall和search）
 python scripts/eval_autosearch_sft.py \
-    --model_path verl/trainer/checkpoints/autosearch_sft_outdata/global_step_42 \
+    --model_path $MODEL_PATH \
     --questions "What is the capital of France?" "Who wrote 1984?"
 
 # 禁用search（仅测试recall）
 python scripts/eval_autosearch_sft.py \
-    --model_path verl/trainer/checkpoints/autosearch_sft_outdata/global_step_42 \
+    --model_path $MODEL_PATH \
     --questions "What is the capital of France?" \
     --disable_search
+
+# 测试多轮交互
+python scripts/eval_autosearch_sft.py \
+    --model_path $MODEL_PATH \
+    --questions "What is the capital of France?" \
+    --max_turns 4
 ```
 
 #### 4.2 评估指标
@@ -171,11 +184,20 @@ python scripts/eval_autosearch_sft.py \
 - Recall工具调用成功率
 - 回忆内容准确性
 
-#### 4.3 训练结果
-- **训练loss**: 从1.943降到0.225（3个epoch）
-- **验证loss**: 从0.500降到0.327
-- **训练步数**: 42步（14步/epoch × 3）
-- **Checkpoint**: 保存在 `verl/trainer/checkpoints/autosearch_sft_outdata/global_step_42/`
+#### 4.3 训练结果对比
+
+**第一版训练（无chat_template）**:
+- 训练loss: 1.943 → 0.225（3个epoch）
+- 验证loss: 0.500 → 0.327
+- 训练步数: 42步（14步/epoch × 3）
+- Checkpoint: `verl/trainer/checkpoints/autosearch_sft_outdata/global_step_42/`
+
+**Chat Template版本（当前）**:
+- 训练loss: 1.553 → 0.496（2个epoch）
+- 验证loss: 0.503 → 0.493
+- 训练步数: 136步（68步/epoch × 2）
+- Checkpoint: `./checkpoints/autosearch_sft_outdata_chatemplate/global_step_136/`
+- **优势**: 验证loss略低于训练loss，无过拟合，模型表现良好
 
 ---
 

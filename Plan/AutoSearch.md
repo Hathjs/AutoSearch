@@ -280,13 +280,14 @@ JSON
 
 **6. Execution Roadmap**
 
-### **Phase 1: SFT (In Progress)**
+### **Phase 1: SFT (Completed)**
 1. ✅ Data generation and rewriting
 2. ✅ Data processing and tokenization (支持chat_template格式)
-3. 🔄 **Chat Template版本SFT训练进行中**（2个epoch，4391条训练数据）
+3. ✅ **Chat Template版本SFT训练已完成**（2个epoch，4391条训练数据）
    - ✅ 框架已升级支持chat_template（与RL训练格式一致）
-   - 🔄 训练进行中：第一个epoch已完成，loss从1.553降到0.471
-4. ⏳ Model evaluation and validation (待训练完成后)
+   - ✅ 训练完成：Train loss 1.553 → 0.496, Val loss 0.503 → 0.493
+   - ✅ Checkpoint: `./checkpoints/autosearch_sft_outdata_chatemplate/global_step_136/`
+4. 🔄 Model evaluation and validation (进行中)
 
 ### **Phase 2: RL Training (Next)**
 1. **Reward Function Design**
