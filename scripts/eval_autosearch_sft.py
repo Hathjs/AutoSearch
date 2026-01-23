@@ -206,9 +206,42 @@ def parse_response(text: str) -> Dict[str, any]:
     return result
 
 
+def compute_em_score(predicted: str, ground_truth: str) -> bool:
+    """
+    Compute Exact Match (EM) score.
+    
+    Args:
+        predicted: Model's predicted answer
+        ground_truth: Ground truth answer
+        
+    Returns:
+        True if exact match, False otherwise
+    """
+    if not predicted or not ground_truth:
+        return False
+    
+    # Normalize: lowercase, strip whitespace
+    pred_norm = predicted.lower().strip()
+    gt_norm = ground_truth.lower().strip()
+    
+    # Direct match
+    if pred_norm == gt_norm:
+        return True
+    
+    # Check if predicted is a substring of ground truth or vice versa
+    # (for cases like "Paris" vs "Paris, France")
+    if pred_norm in gt_norm or gt_norm in pred_norm:
+        # Only accept if the match is substantial (at least 3 characters)
+        if len(pred_norm) >= 3 and len(gt_norm) >= 3:
+            return True
+    
+    return False
+
+
 def evaluate_model(
     model_path: str,
     test_questions: List[str],
+    golden_answers: Optional[List[str]] = None,
     max_new_tokens: int = 1024,
     temperature: float = 0.7,
     device: str = "cuda",
@@ -384,11 +417,10 @@ def evaluate_model(
                         'eos_token_id': tokenizer.eos_token_id,
                     }
                     
-                    # Add stopping criteria if available
-                    # Temporarily disable to debug hanging issues
-                    # TODO: Re-enable after fixing stopping_criteria
-                    # if stopping_criteria is not None:
-                    #     gen_kwargs['stopping_criteria'] = stopping_criteria
+                    # Add stopping criteria to stop at </search>, </recall>, or </answer>
+                    # This enables true multi-turn interaction
+                    if stopping_criteria is not None:
+                        gen_kwargs['stopping_criteria'] = stopping_criteria
                     
                     # Handle sampling parameters safely
                     if temperature > 0:
@@ -463,46 +495,58 @@ def evaluate_model(
                     print("[EOS reached, ending interaction]")
                     break
                 
-                # Decode new tokens
+                # Decode new tokens (only the newly generated part)
                 generated_tokens = outputs[0][input_ids.shape[1]:]
                 output_text = tokenizer.decode(generated_tokens, skip_special_tokens=False)
                 full_response += output_text
                 
                 print(f"Generated: {output_text[:200]}...")
                 
-                # Check what action was taken
+                # Check what action was taken in the FULL generated text so far
                 full_text_so_far = tokenizer.decode(outputs[0], skip_special_tokens=False)
                 
                 search_match = re.search(r'<search>(.*?)</search>', full_text_so_far, re.DOTALL)
                 recall_match = re.search(r'<recall>(.*?)</recall>', full_text_so_far, re.DOTALL)
                 answer_match = re.search(r'<answer>(.*?)</answer>', full_text_so_far, re.DOTALL)
                 
-                # Handle actions
+                # Handle actions - TRUE MULTI-TURN INTERACTION
                 if answer_match:
                     # Final answer found
                     print("[Final answer detected, ending interaction]")
                     break
                 elif search_match:
-                    # Model requested search
+                    # Model requested search - STOP and wait for real results
                     search_query_text = search_match.group(1).strip()
                     print(f"[Model requested search: '{search_query_text}']")
                     
+                    # Extract text up to and including </search>
+                    text_up_to_search = full_text_so_far[:search_match.end()]
+                    prompt = text_up_to_search  # Update prompt to include search action
+                    
                     if enable_search and search_url:
                         try:
+                            print(f"[Calling retrieval server...]")
                             search_results = search_query(search_query_text, search_url)
-                            print(f"[Search results retrieved]")
-                            # Append search feedback to prompt
-                            prompt += output_text + f"\n\n<information>{search_results}</information>\n\n"
+                            print(f"[Search results retrieved: {len(search_results)} chars]")
+                            # Append search feedback to prompt and continue generation
+                            prompt += f"\n\n<information>{search_results}</information>\n\n"
                         except Exception as e:
                             print(f"[WARNING] Search failed: {e}")
-                            prompt += output_text + "\n\n<information>Search service unavailable.</information>\n\n"
+                            prompt += "\n\n<information>Search service unavailable.</information>\n\n"
                     else:
                         print("[Search disabled in evaluation mode]")
-                        prompt += output_text + "\n\n<information>Search disabled in evaluation mode.</information>\n\n"
+                        prompt += "\n\n<information>Search disabled in evaluation mode.</information>\n\n"
+                    
+                    # Continue to next turn to generate answer based on search results
+                    continue
                 elif recall_match:
-                    # Model requested recall (internal memory)
+                    # Model requested recall - STOP and wait for recall results
                     recall_query_text = recall_match.group(1).strip()
                     print(f"[Model requested recall: '{recall_query_text}']")
+                    
+                    # Extract text up to and including </recall>
+                    text_up_to_recall = full_text_so_far[:recall_match.end()]
+                    prompt = text_up_to_recall  # Update prompt to include recall action
                     
                     # Call recall tool to guide model to recall knowledge
                     try:
@@ -517,20 +561,31 @@ def evaluate_model(
                         )
                         print(f"[Memory recalled: {memory_content[:150]}...]")
                         # Append recall output and memory feedback to prompt
-                        prompt += output_text + f"\n\n{memory_content}\n\n"
+                        prompt += f"\n\n{memory_content}\n\n"
                     except Exception as e:
                         print(f"[WARNING] Recall tool failed: {e}")
                         import traceback
                         traceback.print_exc()
                         # Fallback to placeholder
-                        prompt += output_text + "\n\n<memory>No record found.</memory>\n\n"
+                        prompt += "\n\n<memory>No record found.</memory>\n\n"
+                    
+                    # Continue to next turn to generate answer based on memory
+                    continue
                 else:
-                    # No action tag found, continue generation
+                    # No action tag found - check if we should continue or stop
                     if turn >= max_turns:
                         print(f"[Max turns ({max_turns}) reached, stopping]")
                         break
+                    # No action detected, but generation completed - might be incomplete
+                    # Check if we have a complete response or need to continue
+                    if "</answer>" in full_text_so_far or "<answer>" in full_text_so_far:
+                        # Has answer tag, might be complete
+                        answer_match = re.search(r'<answer>(.*?)</answer>', full_text_so_far, re.DOTALL)
+                        if answer_match:
+                            print("[Answer found in generated text, ending interaction]")
+                            break
                     # Continue to next turn
-                    prompt += output_text
+                    prompt = full_text_so_far
         
         except KeyboardInterrupt:
             print("\n\n[Interrupted by user. Saving partial results...]")
@@ -543,6 +598,15 @@ def evaluate_model(
         parsed = parse_response(full_response)
         parsed['question'] = question
         parsed['num_turns'] = turn
+        
+        # Compute EM score if golden answer is provided
+        if golden_answers and i < len(golden_answers):
+            golden_answer = golden_answers[i]
+            parsed['golden_answer'] = golden_answer
+            parsed['em_score'] = compute_em_score(parsed.get('answer', ''), golden_answer)
+        else:
+            parsed['golden_answer'] = None
+            parsed['em_score'] = None
         
         # Print results
         print(f"\n{'='*80}")
@@ -559,6 +623,9 @@ def evaluate_model(
         print(f"  - Has Answer: {parsed['has_answer']}")
         if parsed['answer']:
             print(f"  - Answer: {parsed['answer']}")
+        if parsed.get('golden_answer'):
+            print(f"  - Golden Answer: {parsed['golden_answer']}")
+            print(f"  - EM Score: {'✓' if parsed.get('em_score') else '✗'}")
         
         results.append(parsed)
     
@@ -572,6 +639,14 @@ def evaluate_model(
     print(f"Has Recall: {sum(1 for r in results if r['has_recall'])}/{total} ({sum(1 for r in results if r['has_recall'])/total*100:.1f}%)")
     print(f"Has Search: {sum(1 for r in results if r['has_search'])}/{total} ({sum(1 for r in results if r['has_search'])/total*100:.1f}%)")
     print(f"Has Answer: {sum(1 for r in results if r['has_answer'])}/{total} ({sum(1 for r in results if r['has_answer'])/total*100:.1f}%)")
+    
+    # EM Score statistics
+    em_scores = [r.get('em_score') for r in results if r.get('em_score') is not None]
+    if em_scores:
+        em_count = sum(em_scores)
+        em_total = len(em_scores)
+        em_rate = em_count / em_total * 100 if em_total > 0 else 0
+        print(f"EM Score: {em_count}/{em_total} ({em_rate:.1f}%)")
     
     return results
 
@@ -631,22 +706,39 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    # Load test questions
+    # Load test questions and golden answers
     test_questions = []
+    golden_answers = []
     
     if args.test_file:
         with open(args.test_file, 'r') as f:
             for line in f:
                 if line.strip():
                     data = json.loads(line)
+                    question = None
+                    golden_answer = None
+                    
+                    # Extract question
                     if 'question' in data:
-                        test_questions.append(data['question'])
+                        question = data['question']
                     elif 'messages' in data:
                         # Extract question from messages
                         for msg in data['messages']:
                             if msg['role'] == 'user':
-                                test_questions.append(msg['content'])
+                                question = msg['content']
                                 break
+                    
+                    # Extract golden answer
+                    if 'meta' in data and 'golden_answer' in data['meta']:
+                        golden_answer = data['meta']['golden_answer']
+                    elif 'golden_answer' in data:
+                        golden_answer = data['golden_answer']
+                    elif 'answer' in data:
+                        golden_answer = data['answer']
+                    
+                    if question:
+                        test_questions.append(question)
+                        golden_answers.append(golden_answer)
     
     if args.questions:
         test_questions.extend(args.questions)
@@ -682,6 +774,7 @@ if __name__ == "__main__":
     results = evaluate_model(
         model_path=args.model_path,
         test_questions=test_questions,
+        golden_answers=golden_answers if golden_answers else None,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         search_url=search_url,
