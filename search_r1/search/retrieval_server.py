@@ -210,7 +210,10 @@ class DenseRetriever(BaseRetriever):
         self.index = faiss.read_index(self.index_path)
         if config.faiss_gpu:
             co = faiss.GpuMultipleClonerOptions()
-            co.useFloat16 = True
+            # H20 GPU (Compute Capability 9.0) 兼容性问题：暂时禁用 fp16
+            # TODO: 如果后续 faiss-gpu-cu12 支持 H20 架构，可以恢复为 True
+            # co.useFloat16 = True  # 原始配置：使用 fp16 加速（需要 GPU 支持）
+            co.useFloat16 = False  # 临时修复：使用 fp32 避免 CUDA error 209
             co.shard = True
             self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
 
@@ -381,7 +384,10 @@ if __name__ == "__main__":
         retrieval_model_path=args.retriever_model,
         retrieval_pooling_method="mean",
         retrieval_query_max_length=256,
-        retrieval_use_fp16=True,
+        # H20 GPU (Compute Capability 9.0) 兼容性问题：暂时禁用 fp16
+        # TODO: 如果后续 PyTorch/Transformers 完全支持 H20 架构，可以恢复为 True
+        # retrieval_use_fp16=True,  # 原始配置：使用 fp16 节省显存和加速
+        retrieval_use_fp16=False,  # 临时修复：使用 fp32 避免 CUDA error 209
         retrieval_batch_size=512,
     )
 
