@@ -69,52 +69,26 @@ Question: {question}
 
 class StopOnSequence(StoppingCriteria):
     """Stop generation when encountering specific sequences like </search>, </recall>, </answer>"""
-    def __init__(self, target_sequences: List[str], tokenizer):
-        self.target_ids = [tokenizer.encode(seq, add_special_tokens=False) for seq in target_sequences]
-        # Filter out empty sequences
-        self.target_ids = [tid for tid in self.target_ids if len(tid) > 0]
-        self.target_lengths = [len(target_id) for target_id in self.target_ids]
-        self._tokenizer = tokenizer
-        
-        if len(self.target_lengths) == 0:
-            raise ValueError("No valid target sequences provided")
+    def __init__(self, target_sequences: List[str], tokenizer, prompt_length: int):
+        self.target_sequences = target_sequences
+        self.tokenizer = tokenizer
+        self.prompt_length = prompt_length
 
     def __call__(self, input_ids, scores, **kwargs):
-        # Safety checks
-        try:
-            if input_ids.shape[1] == 0:
-                return False
-            
-            if len(self.target_lengths) == 0:
-                return False
-            
-            min_length = min(self.target_lengths)
-            if input_ids.shape[1] < min_length:
-                return False
-            
-            # Use CPU for comparison to avoid GPU numerical issues
-            # Only check the last few tokens to avoid memory issues
-            # Check up to the maximum target length + some buffer
-            max_check_length = max(self.target_lengths) + 10
-            check_length = min(max_check_length, input_ids.shape[1])
-            input_ids_cpu = input_ids[0, -check_length:].cpu()
-            
-            for i, target_id in enumerate(self.target_ids):
-                if len(target_id) == 0:
-                    continue
-                if input_ids_cpu.shape[0] < len(target_id):
-                    continue
-                
-                # Compare using CPU tensors with proper dtype
-                target_tensor = torch.tensor(target_id, dtype=input_ids.dtype)
-                # Compare the last len(target_tensor) tokens
-                if torch.equal(input_ids_cpu[-len(target_tensor):], target_tensor):
-                    return True
-        except Exception as e:
-            # If comparison fails, don't stop (fail-safe)
-            # Don't print here to avoid flooding output during generation
+        # Only decode the newly generated part
+        if input_ids.shape[1] <= self.prompt_length:
             return False
-        
+            
+        generated_ids = input_ids[0, self.prompt_length:]
+        try:
+            decoded_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            
+            for seq in self.target_sequences:
+                if seq in decoded_text:
+                    return True
+        except Exception:
+            return False
+            
         return False
 
 
@@ -335,11 +309,8 @@ def evaluate_model(
     # Stopping criteria for detecting action tags
     # Use simpler sequences to avoid tokenization issues
     target_sequences = ["</search>", "</recall>", "</answer>"]
-    try:
-        stopping_criteria = StoppingCriteriaList([StopOnSequence(target_sequences, tokenizer)])
-    except Exception as e:
-        print(f"[WARNING] Failed to create stopping criteria: {e}. Continuing without it.")
-        stopping_criteria = None
+    # We will initialize this dynamically in the loop
+    stopping_criteria = True 
     
     results = []
     
@@ -420,6 +391,11 @@ def evaluate_model(
                     # Add stopping criteria to stop at </search>, </recall>, or </answer>
                     # This enables true multi-turn interaction
                     if stopping_criteria is not None:
+                        # Re-initialize stopping criteria with current prompt length for this turn
+                        target_sequences = ["</search>", "</recall>", "</answer>"]
+                        stopping_criteria = StoppingCriteriaList([
+                            StopOnSequence(target_sequences, tokenizer, input_ids.shape[1])
+                        ])
                         gen_kwargs['stopping_criteria'] = stopping_criteria
                     
                     # Handle sampling parameters safely
@@ -505,22 +481,43 @@ def evaluate_model(
                 # Check what action was taken in the FULL generated text so far
                 full_text_so_far = tokenizer.decode(outputs[0], skip_special_tokens=False)
                 
-                search_match = re.search(r'<search>(.*?)</search>', full_text_so_far, re.DOTALL)
-                recall_match = re.search(r'<recall>(.*?)</recall>', full_text_so_far, re.DOTALL)
-                answer_match = re.search(r'<answer>(.*?)</answer>', full_text_so_far, re.DOTALL)
+                # Find ALL matches, not just the first one
+                search_matches = list(re.finditer(r'<search>(.*?)</search>', full_text_so_far, re.DOTALL))
+                recall_matches = list(re.finditer(r'<recall>(.*?)</recall>', full_text_so_far, re.DOTALL))
+                answer_matches = list(re.finditer(r'<answer>(.*?)</answer>', full_text_so_far, re.DOTALL))
                 
                 # Handle actions - TRUE MULTI-TURN INTERACTION
-                if answer_match:
+                if answer_matches:
                     # Final answer found
                     print("[Final answer detected, ending interaction]")
                     break
-                elif search_match:
+                
+                # Check for Search
+                new_search = None
+                if search_matches:
+                    last_search = search_matches[-1]
+                    # Check if this search is followed by information (meaning it's already processed)
+                    post_content = full_text_so_far[last_search.end():]
+                    if "<information>" not in post_content:
+                        new_search = last_search
+
+                # Check for Recall
+                new_recall = None
+                if recall_matches:
+                    last_recall = recall_matches[-1]
+                    # Check if this recall is followed by memory (meaning it's already processed)
+                    post_content = full_text_so_far[last_recall.end():]
+                    if "<memory>" not in post_content:
+                        new_recall = last_recall
+                
+                # Prioritize based on what appears last (though usually only one exists per turn)
+                if new_search and (not new_recall or new_search.start() > new_recall.start()):
                     # Model requested search - STOP and wait for real results
-                    search_query_text = search_match.group(1).strip()
+                    search_query_text = new_search.group(1).strip()
                     print(f"[Model requested search: '{search_query_text}']")
                     
                     # Extract text up to and including </search>
-                    text_up_to_search = full_text_so_far[:search_match.end()]
+                    text_up_to_search = full_text_so_far[:new_search.end()]
                     prompt = text_up_to_search  # Update prompt to include search action
                     
                     if enable_search and search_url:
@@ -534,57 +531,43 @@ def evaluate_model(
                             print(f"[WARNING] Search failed: {e}")
                             prompt += "\n\n<information>Search service unavailable.</information>\n\n"
                     else:
-                        print("[Search disabled in evaluation mode]")
-                        prompt += "\n\n<information>Search disabled in evaluation mode.</information>\n\n"
-                    
-                    # Continue to next turn to generate answer based on search results
-                    continue
-                elif recall_match:
-                    # Model requested recall - STOP and wait for recall results
-                    recall_query_text = recall_match.group(1).strip()
+                         prompt += "\n\n<information>Search disabled.</information>\n\n"
+                         
+                elif new_recall:
+                    # Model requested recall
+                    recall_query_text = new_recall.group(1).strip()
                     print(f"[Model requested recall: '{recall_query_text}']")
                     
                     # Extract text up to and including </recall>
-                    text_up_to_recall = full_text_so_far[:recall_match.end()]
-                    prompt = text_up_to_recall  # Update prompt to include recall action
+                    text_up_to_recall = full_text_so_far[:new_recall.end()]
+                    prompt = text_up_to_recall
                     
-                    # Call recall tool to guide model to recall knowledge
+                    # Call recall tool
+                    print(f"[Calling internal recall tool...]")
                     try:
-                        print(f"[Calling recall tool...]")
-                        memory_content = recall_internal_knowledge(
+                        memory_result = recall_internal_knowledge(
                             query=recall_query_text,
                             model=model,
                             tokenizer=tokenizer,
                             device=device,
                             max_new_tokens=256,
-                            temperature=0.1  # Low temperature for deterministic recall
+                            temperature=0.1
                         )
-                        print(f"[Memory recalled: {memory_content[:150]}...]")
-                        # Append recall output and memory feedback to prompt
-                        prompt += f"\n\n{memory_content}\n\n"
+                        print(f"[Memory retrieved: {len(memory_result)} chars]")
+                        prompt += f"\n\n{memory_result}\n\n"
                     except Exception as e:
                         print(f"[WARNING] Recall tool failed: {e}")
                         import traceback
                         traceback.print_exc()
-                        # Fallback to placeholder
                         prompt += "\n\n<memory>No record found.</memory>\n\n"
-                    
-                    # Continue to next turn to generate answer based on memory
-                    continue
+                
                 else:
-                    # No action tag found - check if we should continue or stop
+                    # No new action detected, but stopped? 
                     if turn >= max_turns:
                         print(f"[Max turns ({max_turns}) reached, stopping]")
                         break
-                    # No action detected, but generation completed - might be incomplete
-                    # Check if we have a complete response or need to continue
-                    if "</answer>" in full_text_so_far or "<answer>" in full_text_so_far:
-                        # Has answer tag, might be complete
-                        answer_match = re.search(r'<answer>(.*?)</answer>', full_text_so_far, re.DOTALL)
-                        if answer_match:
-                            print("[Answer found in generated text, ending interaction]")
-                            break
-                    # Continue to next turn
+                    
+                    # Continue generating
                     prompt = full_text_so_far
         
         except KeyboardInterrupt:
