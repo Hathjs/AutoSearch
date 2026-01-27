@@ -207,15 +207,25 @@ class BM25Retriever(BaseRetriever):
 class DenseRetriever(BaseRetriever):
     def __init__(self, config):
         super().__init__(config)
+        print(f"[DEBUG] Loading FAISS index from {self.index_path}...")
         self.index = faiss.read_index(self.index_path)
+        print(f"[DEBUG] FAISS index loaded successfully.")
         if config.faiss_gpu:
+            print(f"[DEBUG] Initializing FAISS GPU index...")
+            print(f"[DEBUG] CUDA available: {torch.cuda.is_available()}")
+            if torch.cuda.is_available():
+                print(f"[DEBUG] GPU count: {torch.cuda.device_count()}")
+                for i in range(torch.cuda.device_count()):
+                    print(f"[DEBUG] GPU {i}: {torch.cuda.get_device_name(i)}")
             co = faiss.GpuMultipleClonerOptions()
             # H20 GPU (Compute Capability 9.0) 兼容性问题：暂时禁用 fp16
             # TODO: 如果后续 faiss-gpu-cu12 支持 H20 架构，可以恢复为 True
             # co.useFloat16 = True  # 原始配置：使用 fp16 加速（需要 GPU 支持）
             co.useFloat16 = False  # 临时修复：使用 fp32 避免 CUDA error 209
             co.shard = True
+            print(f"[DEBUG] Transferring index to GPU(s)... This may take a while...")
             self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
+            print(f"[DEBUG] FAISS GPU index initialized successfully.")
 
         self.corpus = load_corpus(self.corpus_path)
         self.encoder = Encoder(
