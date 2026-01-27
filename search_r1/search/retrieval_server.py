@@ -254,7 +254,14 @@ class DenseRetriever(BaseRetriever):
             self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
             print(f"[DEBUG] FAISS GPU index initialized successfully.")
 
+        print(f"[DEBUG] Loading corpus from {self.corpus_path}...")
+        start_time = time.time()
         self.corpus = load_corpus(self.corpus_path)
+        elapsed = time.time() - start_time
+        print(f"[DEBUG] Corpus loaded successfully in {elapsed:.2f} seconds. Size: {len(self.corpus)} documents.")
+        
+        print(f"[DEBUG] Initializing E5 encoder model from {config.retrieval_model_path}...")
+        start_time = time.time()
         self.encoder = Encoder(
             model_name = self.retrieval_method,
             model_path = config.retrieval_model_path,
@@ -262,6 +269,8 @@ class DenseRetriever(BaseRetriever):
             max_length = config.retrieval_query_max_length,
             use_fp16 = config.retrieval_use_fp16
         )
+        elapsed = time.time() - start_time
+        print(f"[DEBUG] E5 encoder initialized successfully in {elapsed:.2f} seconds.")
         self.topk = config.retrieval_topk
         self.batch_size = config.retrieval_batch_size
 
