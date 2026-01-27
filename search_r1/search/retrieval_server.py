@@ -208,8 +208,15 @@ class DenseRetriever(BaseRetriever):
     def __init__(self, config):
         super().__init__(config)
         print(f"[DEBUG] Loading FAISS index from {self.index_path}...")
-        self.index = faiss.read_index(self.index_path)
-        print(f"[DEBUG] FAISS index loaded successfully.")
+        print(f"[DEBUG] Using memory mapping (mmap) mode to avoid loading entire 61GB file into memory...")
+        try:
+            # Use mmap mode to avoid loading entire file into memory
+            self.index = faiss.read_index(self.index_path, faiss.IO_FLAG_MMAP)
+            print(f"[DEBUG] FAISS index loaded successfully with memory mapping.")
+        except Exception as e:
+            print(f"[WARNING] mmap mode failed: {e}, falling back to normal mode...")
+            self.index = faiss.read_index(self.index_path)
+            print(f"[DEBUG] FAISS index loaded successfully in normal mode.")
         if config.faiss_gpu:
             print(f"[DEBUG] Initializing FAISS GPU index...")
             print(f"[DEBUG] CUDA available: {torch.cuda.is_available()}")
