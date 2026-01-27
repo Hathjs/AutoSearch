@@ -207,16 +207,36 @@ class BM25Retriever(BaseRetriever):
 class DenseRetriever(BaseRetriever):
     def __init__(self, config):
         super().__init__(config)
+        import time
+        import os
+        
         print(f"[DEBUG] Loading FAISS index from {self.index_path}...")
-        print(f"[DEBUG] Using memory mapping (mmap) mode to avoid loading entire 61GB file into memory...")
+        
+        # Check if file exists and is accessible
+        if not os.path.exists(self.index_path):
+            raise FileNotFoundError(f"Index file not found: {self.index_path}")
+        
+        file_size_gb = os.path.getsize(self.index_path) / (1024**3)
+        print(f"[DEBUG] Index file size: {file_size_gb:.2f} GB")
+        print(f"[DEBUG] File accessible: {os.access(self.index_path, os.R_OK)}")
+        
+        print(f"[DEBUG] Using memory mapping (mmap) mode to avoid loading entire file into memory...")
+        print(f"[DEBUG] Starting faiss.read_index at {time.strftime('%Y-%m-%d %H:%M:%S')}...")
+        
+        start_time = time.time()
         try:
             # Use mmap mode to avoid loading entire file into memory
             self.index = faiss.read_index(self.index_path, faiss.IO_FLAG_MMAP)
-            print(f"[DEBUG] FAISS index loaded successfully with memory mapping.")
+            elapsed = time.time() - start_time
+            print(f"[DEBUG] FAISS index loaded successfully with memory mapping in {elapsed:.2f} seconds.")
         except Exception as e:
-            print(f"[WARNING] mmap mode failed: {e}, falling back to normal mode...")
+            elapsed = time.time() - start_time
+            print(f"[WARNING] mmap mode failed after {elapsed:.2f} seconds: {e}")
+            print(f"[DEBUG] Falling back to normal mode...")
+            start_time = time.time()
             self.index = faiss.read_index(self.index_path)
-            print(f"[DEBUG] FAISS index loaded successfully in normal mode.")
+            elapsed = time.time() - start_time
+            print(f"[DEBUG] FAISS index loaded successfully in normal mode in {elapsed:.2f} seconds.")
         if config.faiss_gpu:
             print(f"[DEBUG] Initializing FAISS GPU index...")
             print(f"[DEBUG] CUDA available: {torch.cuda.is_available()}")
